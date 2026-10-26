@@ -1,5 +1,5 @@
 #! /bin/bash
-# Copyright 2017 Istio Authors.
+# Copyright 2017 Fortio Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,11 @@
 #
 # Ran from the release/Dockerfile[.in] to invoke fpm with common arguments
 # Assumes the layout from the Dockerfiles (/stage source, /tgz destination etc)
-fpm -v $(/stage/usr/bin/fortio version -s) -n fortio --license "Apache License, Version 2.0" \
-    --category utils --url https://fortio.org/ --maintainer fortio@fortio.org \
-    --description "Fortio is a load testing library, command line tool, advanced echo server and web UI in go (golang)." \
-    -s tar -t $1 /tgz/*.tgz
+for f in /tgz/*.tgz; do
+  arch=${f:18}
+  arch=${arch/-*/}
+  fpm -v "$(cat /tmp/version)" -n fortio --license "Apache License, Version 2.0" \
+      --category utils --url https://fortio.org/ --maintainer fortio@fortio.org \
+      --description "Fortio is a load testing library, command line tool, advanced echo server and web UI in go (golang)." \
+      -s tar -t "$1" -a "${arch}" "$f"
+done

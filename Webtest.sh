@@ -1,5 +1,5 @@
 #! /bin/bash
-# Copyright 2017 Istio Authors.
+# Copyright 2017 Fortio Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,9 @@
 # limitations under the License.
 set -x
 # Check we can build the image
-make docker-internal TAG=webtest || exit 1
+NATIVE_PLATFORM=$(docker buildx --builder default inspect | awk '/Platforms:/ {print $2}' | sed -e 's/,//g')
+echo "Building for $NATIVE_PLATFORM"
+make docker-internal TAG=webtest BUILDX_PLATFORMS="$NATIVE_PLATFORM" MODE=dev || exit 1
 FORTIO_UI_PREFIX=/newprefix/ # test the non default prefix (not /fortio/)
 FILE_LIMIT=25 # must be low to detect leaks, go 1.14 seems to need more than go1.8 (!)
 LOGLEVEL=info # change to debug to debug
@@ -26,7 +28,23 @@ DOCKERNAME=fortio_server
 DOCKERSECNAME=fortio_secure_server
 DOCKERSECVOLNAME=fortio_certs
 FORTIO_BIN_PATH=fortio # /usr/bin/fortio is the full path but isn't needed
-DOCKERID=$(docker run -d --ulimit nofile=$FILE_LIMIT --name $DOCKERNAME fortio/fortio:webtest server -ui-path $FORTIO_UI_PREFIX -loglevel $LOGLEVEL -maxpayloadsizekb $MAXPAYLOAD -timeout=$TIMEOUT)
+
+# Unresolvable should error out - #653
+docker run fortio/fortio:webtest curl http://doesnt.exist.google.com/
+if [[ $? == 0 ]]; then
+  echo "Error in curl should show up in status"
+  exit 1
+fi
+
+# Expect error with extra args: (timeout (brew install coreutils) returns 124
+# for timeout) - #652
+timeout 3 docker run fortio/fortio:webtest server -loglevel debug extra-arg
+if [[ $? == 124 || $? == 0 ]]; then
+  echo "Unrecognized extra args/typo in flags should error out immediately"
+  exit 1
+fi
+
+DOCKERID=$(docker run -d --ulimit nofile=$FILE_LIMIT --net host --name $DOCKERNAME fortio/fortio:webtest server -ui-path $FORTIO_UI_PREFIX -loglevel $LOGLEVEL -maxpayloadsizekb $MAXPAYLOAD -timeout=$TIMEOUT -pprof)
 function cleanup {
   set +e # errors are ok during cleanup
 #  docker logs "$DOCKERID" # uncomment to debug
@@ -34,6 +52,7 @@ function cleanup {
   docker rm -f $DOCKERNAME
   docker stop "$DOCKERSECID" # may not be set yet, it's ok
   docker rm -f $DOCKERSECNAME
+  docker stop "$DOCKERCURLID"
   docker rm -f $DOCKERSECVOLNAME
 }
 trap cleanup EXIT
@@ -59,10 +78,12 @@ fi
 $CURL "${BASE_FORTIO}fetch/localhost:8080$FORTIO_UI_PREFIX?url=http://localhost:8080/debug&load=Start&qps=-1&json=on" | grep ActualQPS
 # Check we can do it twice despite ulimit - check we get all 200s (exactly 80 of them (default is 8 connections->16 fds + a few))
 $CURL "${BASE_FORTIO}fetch/localhost:8080$FORTIO_UI_PREFIX?url=http://localhost:8080/debug&load=Start&n=80&qps=-1&json=on" | grep '"200": 80'
+# Same but using the rest api instead
+$CURL "${BASE_FORTIO}fetch/localhost:8080${FORTIO_UI_PREFIX}rest/run?url=http://localhost:8080/debug&n=80&qps=-1" | grep '"200": 80'
 # Check we can connect, and run a grpc QPS test against ourselves through fetch
 $CURL "${BASE_FORTIO}fetch/localhost:8080$FORTIO_UI_PREFIX?url=localhost:8079&load=Start&qps=-1&json=on&n=100&runner=grpc" | grep '"SERVING": 100'
 # Check we get the logo (need to remove the CR from raw headers)
-VERSION=$(docker exec $DOCKERNAME $FORTIO_BIN_PATH version -s)
+VERSION=$(docker exec $DOCKERNAME $FORTIO_BIN_PATH version)
 LOGO_TYPE=$($CURL "${BASE_FORTIO}${VERSION}/static/img/${LOGO}" 2>&1 >/dev/null | grep -i Content-Type: | tr -d '\r'| awk '{print $2}')
 if [ "$LOGO_TYPE" != "image/svg+xml" ]; then
   echo "Unexpected content type for the logo: $LOGO_TYPE"
@@ -83,7 +104,6 @@ if [ "$SIZE" -lt 8191 ] || [ "$SIZE" -gt 8400 ]; then
 fi
 
 # Check main, sync, browse pages
-VERSION=$(docker exec $DOCKERNAME $FORTIO_BIN_PATH version -s)
 LOGOPATH="${VERSION}/static/img/${LOGO}"
 for p in "" browse sync; do
   # Check the page doesn't 404s
@@ -103,19 +123,28 @@ docker exec $DOCKERNAME $FORTIO_BIN_PATH load -H Foo:Bar -H Blah:Blah -qps 1 -t 
 # Do a grpcping
 docker exec $DOCKERNAME $FORTIO_BIN_PATH grpcping localhost
 # Do a grpcping to a scheme-prefixed destination. Fortio should append port number
-# re-enable once we get https://demo.fortio.org/
-# docker exec $DOCKERNAME $FORTIO_BIN_PATH grpcping https://fortio.istio.io
-# docker exec $DOCKERNAME $FORTIO_BIN_PATH grpcping http://fortio.istio.io
-# Do a grpcping with -cert flag. Fortio should use valid cert.
-# docker exec $DOCKERNAME $FORTIO_BIN_PATH grpcping -cacert $CERT fortio.istio.io:443
-# docker exec $DOCKERNAME $FORTIO_BIN_PATH grpcping -cacert $CERT https://fortio.istio.io
+# Do a TLS grpcping. Fortio.org should use valid cert.
+docker exec $DOCKERNAME $FORTIO_BIN_PATH grpcping https://grpc.fortio.org
+docker exec $DOCKERNAME $FORTIO_BIN_PATH grpcping grpc.fortio.org # uses default non tls 8079
 # Do a local grpcping. Fortio should append default grpc port number to destination
 docker exec $DOCKERNAME $FORTIO_BIN_PATH grpcping localhost
+# Do a local health ping
+docker exec $DOCKERNAME $FORTIO_BIN_PATH grpcping -health localhost
+docker exec $DOCKERNAME $FORTIO_BIN_PATH grpcping -health -healthservice ping localhost
+# Do a failing on purpose check
+if docker exec $DOCKERNAME $FORTIO_BIN_PATH grpcping -health -healthservice ping_down localhost; then
+  echo "*** Expecting grpcping -health to ping_down have exit with error/non zero status"
+  exit 1
+fi
 # pprof should be there, no 404/error
 PPROF_URL="$BASE_URL/debug/pprof/heap?debug=1"
 $CURL "$PPROF_URL" | grep -i TotalAlloc # should find this in memory profile
 # creating dummy container to hold a volume for test certs due to remote docker bind mount limitation.
-docker create -v $TEST_CERT_VOL --name $DOCKERSECVOLNAME docker.io/fortio/fortio.build:v38 /bin/true # cleaned up by name
+DOCKERCURLID=$(docker run -d -v $TEST_CERT_VOL --net host --name $DOCKERSECVOLNAME docker.io/fortio/fortio.build:v90@sha256:036f5b5d4df9ce30e0574f212d19ced86ddc7b0255f58a536b008943e5c4efc7 sleep 120)
+# while we have something with actual curl binary do
+# Test for h2c upgrade (#562)
+docker exec $DOCKERSECVOLNAME /usr/bin/curl -v --http2 -m 10 -d foo42 http://localhost:8080/debug | tee >(cat 1>&2) | grep foo42
+# then resume the self signed CA tests
 # copying cert files into the certs volume of the dummy container
 for f in ca.crt server.crt server.key; do docker cp "$PWD/cert-tmp/$f" "$DOCKERSECVOLNAME:$TEST_CERT_VOL/$f"; done
 # start server in secure grpc mode. uses non-default ports to avoid conflicts with fortio_server container.
@@ -128,7 +157,8 @@ docker exec $DOCKERSECNAME $FORTIO_BIN_PATH load -grpc -cacert $TEST_CERT_VOL/ca
 docker stop "$DOCKERID"
 docker rm $DOCKERNAME
 DOCKERNAME=fortio_report
-DOCKERID=$(docker run -d --ulimit nofile=$FILE_LIMIT --name $DOCKERNAME fortio/fortio:webtest report -loglevel $LOGLEVEL)
+# Even with pprof the report mode won't have pprof endpoint
+DOCKERID=$(docker run -d --ulimit nofile=$FILE_LIMIT --name $DOCKERNAME fortio/fortio:webtest report -loglevel $LOGLEVEL -pprof)
 docker ps
 CURL="docker exec $DOCKERNAME $FORTIO_BIN_PATH curl -loglevel $LOGLEVEL"
 if $CURL "$PPROF_URL" ; then
@@ -139,4 +169,6 @@ else
 fi
 # base url should serve report only UI in report mode
 $CURL $BASE_URL | grep "report only limited UI"
+# we should get the tsv without error
+$CURL $BASE_URL/data/index.tsv
 # cleanup() will clean everything left even on success

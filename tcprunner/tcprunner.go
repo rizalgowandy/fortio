@@ -16,16 +16,19 @@ package tcprunner
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sort"
+	"syscall"
 	"time"
 
 	"fortio.org/fortio/fhttp"
 	"fortio.org/fortio/fnet"
-	"fortio.org/fortio/log"
 	"fortio.org/fortio/periodic"
+	"fortio.org/log"
 )
 
 type TCPResultMap map[string]int64
@@ -43,34 +46,36 @@ type RunnerResults struct {
 	aborter       *periodic.Aborter
 }
 
-// Run tests tcp request fetching. Main call being run at the target QPS.
+// Run tests TCP request fetching. Main call being run at the target QPS.
 // To be set as the Function in RunnerOptions.
-func (tcpstate *RunnerResults) Run(t int) {
+func (tcpstate *RunnerResults) Run(_ context.Context, t periodic.ThreadID) (bool, string) {
 	log.Debugf("Calling in %d", t)
 	_, err := tcpstate.client.Fetch()
 	if err != nil {
-		tcpstate.RetCodes[err.Error()]++
-	} else {
-		tcpstate.RetCodes[TCPStatusOK]++
+		errStr := err.Error()
+		tcpstate.RetCodes[errStr]++
+		return false, errStr
 	}
+	tcpstate.RetCodes[TCPStatusOK]++
+	return true, TCPStatusOK
 }
 
 // TCPOptions are options to the TCPClient.
 type TCPOptions struct {
 	Destination      string
 	Payload          []byte // what to send (and check)
-	UnixDomainSocket string // Path of unix domain socket to use instead of host:port from URL
+	UnixDomainSocket string // Path of Unix domain socket to use instead of host:port from URL
 	ReqTimeout       time.Duration
 }
 
-// RunnerOptions includes the base RunnerOptions plus tcp specific
+// RunnerOptions includes the base RunnerOptions plus TCP specific
 // options.
 type RunnerOptions struct {
 	periodic.RunnerOptions
 	TCPOptions // Need to call Init() to initialize
 }
 
-// TCPClient is the client used for tcp echo testing.
+// TCPClient is the client used for TCP echo testing.
 type TCPClient struct {
 	buffer        []byte
 	req           []byte
@@ -87,13 +92,13 @@ type TCPClient struct {
 }
 
 var (
-	// TCPURLPrefix is the URL prefix for triggering tcp load.
+	// TCPURLPrefix is the URL prefix for triggering TCP load.
 	TCPURLPrefix = "tcp://"
 	// TCPStatusOK is the map key on success.
 	TCPStatusOK  = "OK"
-	errShortRead = fmt.Errorf("short read")
-	errLongRead  = fmt.Errorf("bug: long read")
-	errMismatch  = fmt.Errorf("read not echoing writes")
+	errShortRead = errors.New("short read")
+	errLongRead  = errors.New("bug: long read")
+	errMismatch  = errors.New("read not echoing writes")
 )
 
 // GeneratePayload generates a default 24 bytes unique payload for each runner thread and message sent
@@ -109,7 +114,7 @@ func NewTCPClient(o *TCPOptions) (*TCPClient, error) {
 	c := TCPClient{}
 	d := o.Destination
 	c.destination = d
-	tAddr, err := fnet.ResolveDestination(d)
+	tAddr, err := fnet.ResolveDestination(context.Background(), d)
 	if tAddr == nil {
 		return nil, err
 	}
@@ -134,7 +139,7 @@ func NewTCPClient(o *TCPOptions) (*TCPClient, error) {
 
 func (c *TCPClient) connect() (net.Conn, error) {
 	c.socketCount++
-	socket, err := net.Dial(c.dest.Network(), c.dest.String())
+	socket, err := net.Dial(c.dest.Network(), c.dest.String()) //nolint:noctx // TODO have contexts and not just abort channel.
 	if err != nil {
 		log.Errf("Unable to connect to %v : %v", c.dest, err)
 		return nil, err
@@ -155,7 +160,7 @@ func (c *TCPClient) Fetch() ([]byte, error) {
 			return nil, err
 		}
 	} else {
-		log.Debugf("Reusing socket %v", conn)
+		log.Debugf("[%d] Reusing socket %+v", c.connID, conn)
 	}
 	c.socket = nil // because of error returns and single retry
 	conErr := conn.SetReadDeadline(time.Now().Add(c.reqTimeout))
@@ -163,10 +168,11 @@ func (c *TCPClient) Fetch() ([]byte, error) {
 	if c.doGenerate {
 		c.req = GeneratePayload(c.connID, c.messageCount) // TODO write directly in buffer to avoid generating garbage for GC to clean
 	}
+	expectedLen := len(c.req)
 	n, err := conn.Write(c.req)
-	c.bytesSent = c.bytesSent + int64(n)
+	c.bytesSent += int64(n)
 	if log.LogDebug() {
-		log.Debugf("wrote %d (%q): %v", n, string(c.req), err)
+		log.Debugf("[%d] wrote %d (%s): %v", c.connID, n, fnet.DebugSummary(c.req, 256), err)
 	}
 	if err != nil || conErr != nil {
 		if reuse {
@@ -175,25 +181,36 @@ func (c *TCPClient) Fetch() ([]byte, error) {
 			conn.Close()
 			return c.Fetch() // recurse once
 		}
-		log.Errf("Unable to write to %v %v : %v", conn, c.dest, err)
+		log.Errf("[%d] Unable to write to %v: %v", c.connID, c.dest, err)
 		return nil, err
 	}
 	if n != len(c.req) {
-		log.Errf("Short write to %v %v : %d instead of %d", conn, c.dest, n, len(c.req))
+		log.Errf("[%d] Short write to %v: %d instead of %d", c.connID, c.dest, n, expectedLen)
 		return nil, io.ErrShortWrite
 	}
 	// assert that len(c.buffer) == len(c.req)
-	n, err = conn.Read(c.buffer)
-	c.bytesReceived = c.bytesReceived + int64(n)
-	if log.LogDebug() {
-		log.Debugf("read %d (%q): %v", n, string(c.buffer[:n]), err)
-	}
-	if n < len(c.req) {
-		return c.buffer[:n], errShortRead
-	}
-	if n > len(c.req) {
-		log.Errf("BUG: read more than possible %d vs %d", n, len(c.req))
-		return c.buffer[:n], errLongRead
+	totalRead := 0
+	for {
+		n, err = conn.Read(c.buffer[totalRead:])
+		if log.LogDebug() {
+			log.Debugf("[%d] read %d (%s): %v", c.connID, n, fnet.DebugSummary(c.buffer[totalRead:totalRead+n], 256), err)
+		}
+		c.bytesReceived += int64(n)
+		totalRead += n
+		if totalRead == expectedLen { // break first, assuming no err, so we don't test that for EOF case
+			break
+		}
+		if err != nil {
+			log.Errf("[%d] Unable to read: %v", c.connID, err)
+			if errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) {
+				return c.buffer[:totalRead], errShortRead
+			}
+			return c.buffer[:totalRead], err
+		}
+		if totalRead > expectedLen {
+			log.Errf("[%d] BUG: read more than possible +%d to %d vs %d", c.connID, n, totalRead, expectedLen)
+			return c.buffer[:totalRead], errLongRead
+		}
 	}
 	if !bytes.Equal(c.buffer, c.req) {
 		log.Infof("Mismatch between sent %q and received %q", string(c.req), string(c.buffer))
@@ -215,7 +232,7 @@ func (c *TCPClient) Close() int {
 	return c.socketCount
 }
 
-// RunTCPTest runs an tcp test and returns the aggregated stats.
+// RunTCPTest runs a TCP test and returns the aggregated stats.
 // Some refactoring to avoid copy-pasta between the now 3 runners would be good.
 func RunTCPTest(o *RunnerOptions) (*RunnerResults, error) {
 	o.RunType = "TCP"
@@ -232,7 +249,7 @@ func RunTCPTest(o *RunnerOptions) (*RunnerResults, error) {
 	total.Destination = o.Destination
 	tcpstate := make([]RunnerResults, numThreads)
 	var err error
-	for i := 0; i < numThreads; i++ {
+	for i := range numThreads {
 		r.Options().Runners[i] = &tcpstate[i]
 		// Create a client (and transport) and connect once for each 'thread'
 		tcpstate[i].client, err = NewTCPClient(&o.TCPOptions)
@@ -246,15 +263,15 @@ func RunTCPTest(o *RunnerOptions) (*RunnerResults, error) {
 				log.LogVf("first hit of %s: err %v, received %d: %q", o.Destination, err, len(data), data)
 			}
 		}
-		// Setup the stats for each 'thread'
+		// Set up the stats for each 'thread'
 		tcpstate[i].aborter = total.aborter
 		tcpstate[i].RetCodes = make(TCPResultMap)
 	}
 	total.RunnerResults = r.Run()
-	// Numthreads may have reduced but it should be ok to accumulate 0s from
-	// unused ones. We also must cleanup all the created clients.
+	// Numthreads may have reduced, but it should be ok to accumulate 0s from
+	// unused ones. We also must clean up all the created clients.
 	keys := []string{}
-	for i := 0; i < numThreads; i++ {
+	for i := range numThreads {
 		total.SocketCount += tcpstate[i].client.Close()
 		total.BytesReceived += tcpstate[i].client.bytesReceived
 		total.BytesSent += tcpstate[i].client.bytesSent

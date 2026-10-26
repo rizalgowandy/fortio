@@ -1,16 +1,46 @@
 # Concatenated after ../Dockerfile to create the tgz
-FROM docker.io/fortio/fortio.build:v38 as stage
+FROM docker.io/fortio/fortio.build:v90@sha256:036f5b5d4df9ce30e0574f212d19ced86ddc7b0255f58a536b008943e5c4efc7 AS stage
+ARG archs="amd64 arm64 ppc64le s390x"
+ENV archs=${archs}
+# Build image defaults to build user, switch back to root for
+# release making.
+USER root:root
 WORKDIR /stage
-COPY --from=release /usr/bin/fortio usr/bin/fortio
 #COPY --from=release /usr/share/fortio usr/share/fortio
 COPY docs/fortio.1 usr/share/man/man1/fortio.1
-RUN mkdir /tgz
-# Make sure the list here is both minimal and complete
-# we could take all of * but that adds system directories to the tar
-RUN tar cvf - usr/share/man/man1/fortio.1 usr/bin/fortio | gzip --best > /tgz/fortio-linux_x64-$(./usr/bin/fortio version -s).tgz
-COPY --from=build /go/src/fortio.org/fortio.exe usr/share/fortio/
-WORKDIR /stage/usr/share/fortio
-RUN zip -9 -r fortio_win_$(/stage/usr/bin/fortio version -s).zip fortio.exe && mv *.zip /tgz
+
+RUN mkdir -p /tgz usr/bin
+
+WORKDIR /build
+COPY . fortio
+# Check macos does not break
+RUN make -C fortio official-build BUILD_DIR=/build OFFICIAL_DIR=/tmp/fortio_mac GOOS=darwin GO_BIN=/usr/local/go/bin/go
+# Windows release
+RUN make -C fortio official-build BUILD_DIR=/build OFFICIAL_DIR=/tmp/fortio_win GOOS=windows
+RUN mv /tmp/fortio_win/fortio.exe /tmp/fortio.exe
+# Linux per-architecture binaries building
+RUN sh -c \
+    'set -ex; for arch in ${archs}; do \
+       make -C fortio official-build BUILD_DIR=/build GOARCH=${arch} OFFICIAL_DIR=/tmp/fortio_${arch}; \
+    done'
+
+RUN cd fortio && /tmp/fortio_$(go env GOARCH)/fortio version > /tmp/version
+
+WORKDIR /stage
+
+# Make per-architecture .tgz files
+RUN sh -c \
+    'set -ex; for arch in ${archs}; do \
+        cp /tmp/fortio_${arch}/fortio usr/bin/fortio; \
+        # Make sure the list here is both minimal and complete \
+        # we could take all of * but that adds system directories to the tar \
+        tar cvf - usr/share/man/man1/fortio.1 usr/bin/fortio | gzip --best > /tgz/fortio-linux_${arch}-$(cat /tmp/version).tgz; \
+        rm -f usr/bin/fortio; \
+    done'
+
+WORKDIR /tmp
+RUN zip -9 -r fortio_win_$(cat /tmp/version).zip fortio.exe && mv *.zip /tgz
+
 WORKDIR /tgz
 COPY release/ffpm.sh /
 RUN bash -x /ffpm.sh deb

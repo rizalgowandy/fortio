@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors.
+// Copyright 2017 Fortio Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,19 +16,22 @@
 package fgrpc
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
 	"time"
 
+	"fortio.org/fortio/fhttp"
 	"fortio.org/fortio/fnet"
-	"fortio.org/fortio/log"
 	"fortio.org/fortio/stats"
-	"golang.org/x/net/context"
+	"fortio.org/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	_ "google.golang.org/grpc/encoding/gzip" // Install the gzip compressor
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/reflection"
 )
 
@@ -42,23 +45,27 @@ const (
 type pingSrv struct{}
 
 func (s *pingSrv) Ping(c context.Context, in *PingMessage) (*PingMessage, error) {
-	log.LogVf("Ping called %+v (ctx %+v)", *in, c)
+	md, _ := metadata.FromIncomingContext(c)
+	log.LogVf("Ping called %+v (meta %+v)", *in, md)
 	out := *in // copy the input including the payload etc
 	out.Ts = time.Now().UnixNano()
-	if in.DelayNanos > 0 {
-		s := time.Duration(in.DelayNanos)
+	if in.GetDelayNanos() > 0 {
+		s := time.Duration(in.GetDelayNanos())
 		log.LogVf("GRPC ping: sleeping for %v", s)
 		time.Sleep(s)
 	}
 	return &out, nil
 }
 
-// PingServer starts a grpc ping (and health) echo server.
+// PingServer starts a gRPC ping (and health) echo server.
 // returns the port being bound (useful when passing "0" as the port to
 // get a dynamic server). Pass the healthServiceName to use for the
-// grpc service name health check (or pass DefaultHealthServiceName)
+// gRPC service name health check (or pass DefaultHealthServiceName)
 // to be marked as SERVING. Pass maxConcurrentStreams > 0 to set that option.
-func PingServer(port, cert, key, healthServiceName string, maxConcurrentStreams uint32) net.Addr {
+func PingServer(port, healthServiceName string, maxConcurrentStreams uint32, tlsOptions *fhttp.TLSOptions) net.Addr {
+	if healthServiceName == "" {
+		healthServiceName = DefaultHealthServiceName
+	}
 	socket, addr := fnet.Listen("grpc '"+healthServiceName+"'", port)
 	if addr == nil {
 		return nil
@@ -68,19 +75,24 @@ func PingServer(port, cert, key, healthServiceName string, maxConcurrentStreams 
 		log.Infof("Setting grpc.MaxConcurrentStreams server to %d", maxConcurrentStreams)
 		grpcOptions = append(grpcOptions, grpc.MaxConcurrentStreams(maxConcurrentStreams))
 	}
-	if cert != "" && key != "" {
-		creds, err := credentials.NewServerTLSFromFile(cert, key)
+	if tlsOptions.Cert != "" && tlsOptions.Key != "" {
+		tlsCfg, err := tlsOptions.TLSConfig()
 		if err != nil {
-			log.Fatalf("Invalid TLS credentials: %v\n", err)
+			log.Fatalf("Invalid TLS credentials: %v", err)
 		}
-		log.Infof("Using server certificate %v to construct TLS credentials", cert)
-		log.Infof("Using server key %v to construct TLS credentials", key)
+		creds := credentials.NewTLS(tlsCfg)
+		mtls := ""
+		if tlsOptions.MTLS {
+			mtls = "mutual "
+		}
+		log.Printf("Using server cert and key from %v and %v to construct %sTLS credentials", tlsOptions.Cert, tlsOptions.Key, mtls)
 		grpcOptions = append(grpcOptions, grpc.Creds(creds))
 	}
 	grpcServer := grpc.NewServer(grpcOptions...)
 	reflection.Register(grpcServer)
 	healthServer := health.NewServer()
 	healthServer.SetServingStatus(healthServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
+	healthServer.SetServingStatus(healthServiceName+"_down", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
 	grpc_health_v1.RegisterHealthServer(grpcServer, healthServer)
 	RegisterPingServerServer(grpcServer, &pingSrv{})
 	go func() {
@@ -91,10 +103,10 @@ func PingServer(port, cert, key, healthServiceName string, maxConcurrentStreams 
 	return addr
 }
 
-// PingServerTCP is PingServer() assuming tcp instead of possible unix domain socket port, returns
+// PingServerTCP is PingServer() assuming TCP instead of possible Unix domain socket port, returns
 // the numeric port.
-func PingServerTCP(port, cert, key, healthServiceName string, maxConcurrentStreams uint32) int {
-	addr := PingServer(port, cert, key, healthServiceName, maxConcurrentStreams)
+func PingServerTCP(port, healthServiceName string, maxConcurrentStreams uint32, tlsOptions *fhttp.TLSOptions) int {
+	addr := PingServer(port, healthServiceName, maxConcurrentStreams, tlsOptions)
 	if addr == nil {
 		return -1
 	}
@@ -105,16 +117,22 @@ func PingServerTCP(port, cert, key, healthServiceName string, maxConcurrentStrea
 
 // PingClientCall calls the ping service (presumably running as PingServer on
 // the destination). returns the average round trip in seconds.
-func PingClientCall(serverAddr, cacert string, n int, payload string, delay time.Duration, insecure bool) (float64, error) {
-	o := GRPCRunnerOptions{Destination: serverAddr, CACert: cacert, Insecure: insecure}
+func PingClientCall(serverAddr string, n int, payload string, delay time.Duration, tlsOpts *fhttp.TLSOptions, md metadata.MD,
+) (float64, error) {
+	o := GRPCRunnerOptions{Destination: serverAddr, TLSOptions: *tlsOpts, Metadata: md}
+	o.dialOptions, o.filteredMetadata = extractDialOptionsAndFilter(md)
 	conn, err := Dial(&o) // somehow this never seem to error out, error comes later
 	if err != nil {
 		return -1, err // error already logged
 	}
 	msg := &PingMessage{Payload: payload, DelayNanos: delay.Nanoseconds()}
 	cli := NewPingServerClient(conn)
+	outCtx := context.Background()
+	if md.Len() != 0 {
+		outCtx = metadata.NewOutgoingContext(outCtx, o.filteredMetadata)
+	}
 	// Warm up:
-	_, err = cli.Ping(context.Background(), msg)
+	_, err = cli.Ping(outCtx, msg)
 	if err != nil {
 		log.Errf("grpc error from Ping0 %v", err)
 		return -1, err
@@ -125,16 +143,16 @@ func PingClientCall(serverAddr, cacert string, n int, payload string, delay time
 		msg.Seq = int64(i)
 		t1a := time.Now().UnixNano()
 		msg.Ts = t1a
-		res1, err := cli.Ping(context.Background(), msg)
+		res1, err := cli.Ping(outCtx, msg)
 		t2a := time.Now().UnixNano()
 		if err != nil {
 			log.Errf("grpc error from Ping1 iter %d: %v", i, err)
 			return -1, err
 		}
-		t1b := res1.Ts
-		res2, err := cli.Ping(context.Background(), msg)
+		t1b := res1.GetTs()
+		res2, err := cli.Ping(outCtx, msg)
 		t3a := time.Now().UnixNano()
-		t2b := res2.Ts
+		t2b := res2.GetTs()
 		if err != nil {
 			log.Errf("grpc error from Ping2 iter %d: %v", i, err)
 			return -1, err
@@ -161,11 +179,12 @@ func PingClientCall(serverAddr, cacert string, n int, payload string, delay time
 // HealthResultMap short cut for the map of results to count.
 type HealthResultMap map[string]int64
 
-// GrpcHealthCheck makes a grpc client call to the standard grpc health check
+// GrpcHealthCheck makes a gRPC client call to the standard gRPC health check
 // service.
-func GrpcHealthCheck(serverAddr, cacert string, svcname string, n int, insecure bool) (*HealthResultMap, error) {
-	log.Debugf("GrpcHealthCheck for %s svc '%s', %d iterations", serverAddr, svcname, n)
-	o := GRPCRunnerOptions{Destination: serverAddr, CACert: cacert, Insecure: insecure}
+func GrpcHealthCheck(serverAddr, svcname string, n int, tlsOpts *fhttp.TLSOptions, md metadata.MD) (*HealthResultMap, error) {
+	log.Infof("GrpcHealthCheck for %s svc '%s', %d iterations", serverAddr, svcname, n)
+	o := GRPCRunnerOptions{Destination: serverAddr, TLSOptions: *tlsOpts, Metadata: md}
+	o.dialOptions, o.filteredMetadata = extractDialOptionsAndFilter(md)
 	conn, err := Dial(&o)
 	if err != nil {
 		return nil, err
@@ -175,16 +194,20 @@ func GrpcHealthCheck(serverAddr, cacert string, svcname string, n int, insecure 
 	rttHistogram := stats.NewHistogram(0, 10)
 	statuses := make(HealthResultMap)
 
+	outCtx := context.Background()
+	if md.Len() != 0 {
+		outCtx = metadata.NewOutgoingContext(outCtx, o.filteredMetadata)
+	}
 	for i := 1; i <= n; i++ {
 		start := time.Now()
-		res, err := cli.Check(context.Background(), msg)
+		res, err := cli.Check(outCtx, msg)
 		dur := time.Since(start)
 		log.LogVf("Reply from health check %d: %+v", i, res)
 		if err != nil {
 			log.Errf("grpc error from Check %v", err)
 			return nil, err
 		}
-		statuses[res.Status.String()]++
+		statuses[res.GetStatus().String()]++
 		rttHistogram.Record(dur.Seconds() * 1000000.)
 	}
 	rttHistogram.Print(os.Stdout, "RTT histogram usec", []float64{50})

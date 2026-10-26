@@ -1,22 +1,17 @@
 # Build the binaries in larger image
-FROM docker.io/fortio/fortio.build:v38 as build
-WORKDIR /go/src/fortio.org
-COPY . fortio
+FROM docker.io/fortio/fortio.build:v90@sha256:036f5b5d4df9ce30e0574f212d19ced86ddc7b0255f58a536b008943e5c4efc7 AS build
+WORKDIR /build
+COPY --chown=build:build . fortio
+ARG MODE=install
 # We moved a lot of the logic into the Makefile so it can be reused in brew
 # but that also couples the 2, this expects to find binaries in the right place etc
-RUN make -C fortio official-build-version BUILD_DIR=/build OFFICIAL_BIN=../fortio_go_latest.bin
-# Check we still build with go 1.8 (and macos does not break)
-RUN make -C fortio official-build BUILD_DIR=/build OFFICIAL_BIN=../fortio_go_latest.mac GOOS=darwin GO_BIN=/usr/local/go/bin/go
-# Windows release, for now assumes running from fortio directory (static resources in .)
-RUN make -C fortio official-build BUILD_DIR=/build LIB_DIR=. OFFICIAL_BIN=../fortio.exe GOOS=windows
+RUN make -C fortio official-build-version BUILD_DIR=/build MODE=${MODE}
+
 # Minimal image with just the binary and certs
-FROM scratch as release
-# NOTE: the list of files here, if updated, must be changed in release/Dockerfile.in too
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-# TODO: get rid of *.bak, *~ and other spurious non source files
-#COPY --from=build /go/src/fortio.org/fortio/ui/static /usr/share/fortio/static
-#COPY --from=build /go/src/fortio.org/fortio/ui/templates /usr/share/fortio/templates
-COPY --from=build /go/src/fortio.org/fortio_go_latest.bin /usr/bin/fortio
+FROM scratch AS release
+# We don't need to copy certs anymore since cli 1.6.0
+# COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=build /build/result/fortio /usr/bin/fortio
 EXPOSE 8078
 EXPOSE 8079
 EXPOSE 8080
@@ -28,4 +23,4 @@ VOLUME /var/lib/fortio
 WORKDIR /var/lib/fortio
 ENTRYPOINT ["/usr/bin/fortio"]
 # start the server mode (grpc ping on 8079, http echo and UI on 8080, redirector on 8081) by default
-CMD ["server", "-config", "/etc/fortio"]
+CMD ["server", "-config-dir", "/etc/fortio"]

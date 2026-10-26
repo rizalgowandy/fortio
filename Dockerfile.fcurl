@@ -1,11 +1,10 @@
 # Build the binaries in larger image
-FROM docker.io/fortio/fortio.build:v38 as build
-WORKDIR /go/src/fortio.org
+FROM docker.io/fortio/fortio.build:v90@sha256:036f5b5d4df9ce30e0574f212d19ced86ddc7b0255f58a536b008943e5c4efc7 AS build
+WORKDIR /build
 COPY . fortio
-# fcurl should not need vendor/no dependencies
-RUN make -C fortio official-build-version BUILD_DIR=/build OFFICIAL_TARGET=fortio.org/fortio/fcurl OFFICIAL_BIN=../fcurl.bin
+RUN make -C fortio official-build-version BUILD_DIR=/build OFFICIAL_TARGET=fortio.org/fortio/fcurl
 # Minimal image with just the binary and certs
 FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=build /go/src/fortio.org/fcurl.bin /usr/bin/fcurl
+COPY --from=build /build/result/fcurl /usr/bin/fcurl
 ENTRYPOINT ["/usr/bin/fcurl"]

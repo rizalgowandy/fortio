@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright 2017 Fortio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,8 +24,8 @@ import (
 	"os"
 	"strconv"
 
-	"fortio.org/fortio/log"
 	"fortio.org/fortio/stats"
+	"fortio.org/log"
 )
 
 func main() {

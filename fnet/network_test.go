@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright 2017-2023 Fortio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,18 +17,19 @@ package fnet_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"fortio.org/fortio/fnet"
-	"fortio.org/fortio/log"
 	"fortio.org/fortio/version"
+	"fortio.org/log"
 )
 
 func TestNormalizePort(t *testing.T) {
@@ -57,7 +58,7 @@ func TestNormalizePort(t *testing.T) {
 	for _, tc := range tests {
 		port := fnet.NormalizePort(tc.input)
 		if port != tc.output {
-			t.Errorf("Test case %s failed to normailze port %s\n\texpected: %s\n\t  actual: %s",
+			t.Errorf("Test case %s failed to normalize port %s\n\texpected: %s\n\t  actual: %s",
 				tc.name,
 				tc.input,
 				tc.output,
@@ -115,6 +116,7 @@ func TestResolveDestination(t *testing.T) {
 		{"using ip:bogussvc", "8.8.8.8:doesnotexisthopefully", ""},
 		{"using bogus hostname", "doesnotexist.fortio.org:443", ""},
 		{"using udp://ip:portname", "udp://8.8.8.8:http", ""},
+		{"empty host", ":80", ""},
 		// Good cases:
 		{"using tcp://ip:portname", "tcp://8.8.8.8:http", "8.8.8.8:80"},
 		{"using tcp://ip:portname/", "tcp://8.8.8.8:http/", "8.8.8.8:80"},
@@ -122,10 +124,10 @@ func TestResolveDestination(t *testing.T) {
 		{"using ip:port", "8.8.8.8:12345", "8.8.8.8:12345"},
 		{"using [ipv6]:port", "[::1]:12345", "[::1]:12345"},
 	}
+	ctx := context.Background()
 	for _, tt := range tests {
-		tt := tt // pin
 		t.Run(tt.name, func(t *testing.T) {
-			got, _ := fnet.TCPResolveDestination(tt.destination)
+			got, _ := fnet.TCPResolveDestination(ctx, tt.destination)
 			gotStr := ""
 			if got != nil {
 				gotStr = got.String()
@@ -155,10 +157,10 @@ func TestUDPResolveDestination(t *testing.T) {
 		{"using ip:port", "8.8.8.8:12345", "8.8.8.8:12345"},
 		{"using [ipv6]:port", "[::1]:12345", "[::1]:12345"},
 	}
+	ctx := context.Background()
 	for _, tt := range tests {
-		tt := tt // pin
 		t.Run(tt.name, func(t *testing.T) {
-			got, _ := fnet.UDPResolveDestination(tt.destination)
+			got, _ := fnet.UDPResolveDestination(ctx, tt.destination)
 			gotStr := ""
 			if got != nil {
 				gotStr = got.String()
@@ -171,24 +173,33 @@ func TestUDPResolveDestination(t *testing.T) {
 }
 
 func TestResolveDestinationMultipleIps(t *testing.T) {
-	addr, err := fnet.TCPResolveDestination("www.google.com:443")
-	t.Logf("Found google addr %+v err=%v", addr, err)
+	ctx := context.Background()
+	addr, err := fnet.TCPResolveDestination(ctx, "debug.fortio.org:443")
+	t.Logf("Found debug.fortio.org addr %+v err=%v", addr, err)
 	if addr == nil || err != nil {
-		t.Errorf("got nil address for google: %v", err)
+		t.Errorf("got nil address for debug.fortio.org: %v", err)
 	}
 }
 
 func TestProxy(t *testing.T) {
-	addr := fnet.ProxyToDestination(":0", "www.google.com:80")
+	ctx := context.Background()
+	addr := fnet.ProxyToDestination(ctx, ":0", "www.google.com:80")
 	dAddr := net.TCPAddr{Port: addr.(*net.TCPAddr).Port}
+	t.Logf("Proxying %v to %v", addr, dAddr)
 	d, err := net.DialTCP("tcp", nil, &dAddr)
 	if err != nil {
 		t.Fatalf("can't connect to our proxy: %v", err)
 	}
 	defer d.Close()
-	data := "HEAD / HTTP/1.0\r\nUser-Agent: fortio-unit-test-" + version.Long() + "\r\n\r\n"
-	_, _ = d.Write([]byte(data))
-	_ = d.CloseWrite()
+	data := "HEAD / HTTP/1.0\r\nUser-Agent: fortio-unit-test\r\n\r\n"
+	_, err = d.Write([]byte(data))
+	if err != nil {
+		t.Errorf("can't write to our proxy: %v", err)
+	}
+	err = d.CloseWrite()
+	if err != nil {
+		t.Errorf("can't CloseWrite to our proxy: %v", err)
+	}
 	res := make([]byte, 4096)
 	n, err := d.Read(res)
 	if err != nil {
@@ -224,15 +235,16 @@ func TestTcpEcho(t *testing.T) {
 }
 
 func TestUdpEcho(t *testing.T) {
-	for i := 0; i <= 1; i++ {
+	ctx := context.Background()
+	for i := range 2 {
 		async := (i == 0)
 		addr := fnet.UDPEchoServer("test-udp-echo", ":0", async)
 		port := addr.(*net.UDPAddr).Port
-		in := ioutil.NopCloser(strings.NewReader("ABCDEF"))
+		in := io.NopCloser(strings.NewReader("ABCDEF"))
 		var buf bytes.Buffer
 		dest := fmt.Sprintf("udp://localhost:%d", port)
 		out := bufio.NewWriter(&buf)
-		err := fnet.NetCat(dest, in, out, true)
+		err := fnet.NetCat(ctx, dest, in, out, true)
 		if err != nil {
 			t.Errorf("Unexpected NetCat err: %v", err)
 		}
@@ -266,24 +278,20 @@ func TestTCPEchoServerErrors(t *testing.T) {
 	if addr2 != nil {
 		t.Errorf("Second proxy on same port should have failed, got %+v", addr2)
 	}
-	// For some reason unable to trigger these 2 cases within go
-	// TODO: figure it out... this is now only triggering coverage but not really testing anything
-	// quite brittle but somehow we can get read: connection reset by peer and write: broken pipe
-	// with these timings (!)
+	// Moved race issue to network_test_norace.go
 	eofStopFlag := false
-	for i := 0; i < 2; i++ {
-		in := ioutil.NopCloser(strings.NewReader(strings.Repeat("x", 50000)))
-		var out ErroringWriter
-		fnet.NetCat("localhost"+port, in, &out, eofStopFlag)
-		eofStopFlag = true
-	}
+	ctx := context.Background()
+	in := io.NopCloser(strings.NewReader(strings.Repeat("x", 50000)))
+	var out ErroringWriter
+	fnet.NetCat(ctx, "localhost"+port, in, &out, eofStopFlag)
 }
 
 func TestNetCatErrors(t *testing.T) {
 	listener, addr := fnet.Listen("test-closed-listener", ":0")
 	dAddr := net.TCPAddr{Port: addr.(*net.TCPAddr).Port}
 	listener.Close()
-	err := fnet.NetCat("localhost"+dAddr.String(), nil, nil, true)
+	ctx := context.Background()
+	err := fnet.NetCat(ctx, "localhost"+dAddr.String(), nil, nil, true)
 	if err == nil {
 		t.Errorf("Expected connect error on closed server, got success")
 	}
@@ -291,7 +299,8 @@ func TestNetCatErrors(t *testing.T) {
 
 func TestSetSocketBuffersError(t *testing.T) {
 	c := &net.UnixConn{}
-	fnet.SetSocketBuffers(c, 512, 256) // triggers 22:11:14 V network.go:245> Not setting socket options on non tcp socket <nil>
+	fnet.SetSocketBuffers(c, 512, 256) // triggers 22:11:14 V network.go:245> Not setting socket options on non-TCP socket <nil>
+	t.Logf("SetSocketBuffers on non tcp socket %v", c)
 }
 
 func TestSmallReadUntil(t *testing.T) {
@@ -368,13 +377,14 @@ func TestDefaultGetUniqueUnixDomainPath(t *testing.T) {
 func TestUnixDomain(t *testing.T) {
 	// Test through the proxy as well (which indirectly tests fnet.Listen)
 	fname := fnet.GetUniqueUnixDomainPath("fortio-uds-test")
-	addr := fnet.ProxyToDestination(fname, "www.google.com:80")
+	ctx := context.Background()
+	addr := fnet.ProxyToDestination(ctx, fname, "www.google.com:80")
 	defer os.Remove(fname) // to not leak the temp socket
 	if addr == nil {
 		t.Fatalf("Nil socket in unix socket proxy listen")
 	}
 	hp := fnet.NormalizeHostPort("", addr)
-	expected := fmt.Sprintf("-unix-socket=%s", fname)
+	expected := "-unix-socket=" + fname
 	if hp != expected {
 		t.Errorf("Got %s, expected %s from fnet.NormalizeHostPort(%v)", hp, expected, addr)
 	}
@@ -400,7 +410,8 @@ func TestUnixDomain(t *testing.T) {
 }
 
 func TestProxyErrors(t *testing.T) {
-	addr := fnet.ProxyToDestination(":0", "doesnotexist.fortio.org:80")
+	ctx := context.Background()
+	addr := fnet.ProxyToDestination(ctx, ":0", "doesnotexist.fortio.org:80")
 	dAddr := net.TCPAddr{Port: addr.(*net.TCPAddr).Port}
 	d, err := net.DialTCP("tcp", nil, &dAddr)
 	if err != nil {
@@ -413,14 +424,15 @@ func TestProxyErrors(t *testing.T) {
 		t.Errorf("didn't get expected error with proxy %d", n)
 	}
 	// 2nd proxy on same port should fail
-	addr2 := fnet.ProxyToDestination(fnet.GetPort(addr), "www.google.com:80")
+	addr2 := fnet.ProxyToDestination(ctx, fnet.GetPort(addr), "debug.fortio.org:80")
 	if addr2 != nil {
 		t.Errorf("Second proxy on same port should have failed, got %+v", addr2)
 	}
 }
 
 func TestResolveIpV6(t *testing.T) {
-	addr, err := fnet.ResolveByProto("[::1]", "http", "tcp")
+	ctx := context.Background()
+	addr, err := fnet.ResolveByProto(ctx, "[::1]", "http", "tcp")
 	addrStr := addr.String()
 	expected := "[::1]:80"
 	if addrStr != expected {
@@ -429,24 +441,156 @@ func TestResolveIpV6(t *testing.T) {
 }
 
 func TestResolveBW(t *testing.T) {
-	addr, err := fnet.Resolve("8.8.8.8", "zzzzzz")
+	ctx := context.Background()
+	addr, err := fnet.Resolve(ctx, "8.8.8.8", "zzzzzz")
 	if err == nil {
 		t.Errorf("should have errored out but got %v", addr)
 	}
-	addr, err = fnet.Resolve("8.8.4.4", "domain")
+	// Use a service name that is in go's builtin table (no /etc/services on windows/netgo).
+	addr, err = fnet.Resolve(ctx, "8.8.4.4", "https")
 	if err != nil {
 		t.Errorf("should have not errored out but got %v", err)
 	}
-	expecting := "8.8.4.4:53"
+	expecting := "8.8.4.4:443"
 	if addr.String() != expecting {
 		t.Errorf("expecting %q got %q", expecting, addr.String())
 	}
-	addr, err = fnet.ResolveDestination("8.8.4.4:domain")
+	addr, err = fnet.ResolveDestination(ctx, "8.8.4.4:https")
 	if err != nil {
-		t.Errorf("should hav enot  errored out but got %v", err)
+		t.Errorf("should have not errored out but got %v", err)
 	}
 	if addr.String() != expecting {
 		t.Errorf("expecting %q got %q", expecting, addr.String())
+	}
+}
+
+// This test relies on dnstest.fortio.org having 1 ipv4 and 1 ipv6,
+// if that's not the case anymore or in the testing environment, this will fail.
+func TestDNSMethods(t *testing.T) {
+	ctx := context.Background()
+	err := fnet.FlagResolveMethod.Set("first")
+	if err != nil {
+		t.Errorf("unexpected error setting method to first: %v", err)
+	}
+	fnet.FlagResolveIPType.Set("ip4")
+	addr4, err := fnet.Resolve(ctx, "debug.fortio.org", "80")
+	if err != nil {
+		t.Errorf("error ip4 resolving debug.fortio.org: %v", err)
+	}
+	fnet.FlagResolveIPType.Set("ip6")
+	addr6, err := fnet.Resolve(ctx, "debug.fortio.org", "80")
+	if err != nil {
+		t.Errorf("error ip6 resolving debug.fortio.org: %v", err)
+	}
+	if addr4.String() == addr6.String() {
+		t.Errorf("ipv4 %v and ipv6 %v shouldn't be same", addr4, addr6)
+	}
+	fnet.FlagResolveIPType.Set("ip")
+	addrFirst, err := fnet.Resolve(ctx, "dnstest.fortio.org", "80")
+	if err != nil {
+		t.Errorf("error ip any resolving dnstest.fortio.org: %v", err)
+	}
+	// For fortio, ipv6 comes first (or at least it does on my fullstack mac)
+	if addrFirst.String() != addr6.String() {
+		// dns might change when not in cached mode
+		log.Warnf("first ip %v not ipv6 %v", addrFirst, addr6)
+	}
+	addrSecond, err := fnet.Resolve(ctx, "dnstest.fortio.org", "80")
+	if err != nil {
+		t.Errorf("error ip any resolving (2) dnstest.fortio.org: %v", err)
+	}
+	if addrFirst.String() != addrSecond.String() {
+		log.Warnf("first ip %v not == second %v in first mode", addrFirst, addrSecond)
+	}
+	err = fnet.FlagResolveMethod.Set("cached-rr")
+	if err != nil {
+		t.Fatalf("error setting back cached-rr mode: %v", err)
+	}
+	addrThird, err := fnet.Resolve(ctx, "dnstest.fortio.org", "80")
+	if err != nil {
+		t.Errorf("error ip any resolving (3) dnstest.fortio.org: %v", err)
+	}
+	if addrFirst.String() != addrThird.String() {
+		log.Warnf("first cached ip %v not == first %v in cached-rr mode", addrThird, addrFirst)
+	}
+	addrFourth, err := fnet.Resolve(ctx, "dnstest.fortio.org", "80")
+	if err != nil {
+		t.Errorf("error ip any resolving (4) dnstest.fortio.org: %v", err)
+	}
+	if addrFourth.String() != addr6.String() {
+		log.Warnf("second cached ip %v not == ipv6 %v in cached-rr mode", addrFourth, addr6)
+	}
+	if addrFourth.String() == addrThird.String() {
+		t.Errorf("in cached rr mode, 2nd call %v shouldn't be same as first %v for dnstest.fortio.org", addrFourth, addrThird)
+	}
+	// back to first (rr) [only if there are only 2 ips]
+	addrFifth, err := fnet.Resolve(ctx, "dnstest.fortio.org", "80")
+	if err != nil {
+		t.Errorf("error ip any resolving (5) dnstest.fortio.org: %v", err)
+	}
+	if addrThird.String() != addrFifth.String() {
+		log.Warnf("third cached ip %v not == back to first %v in cached-rr mode (if only 2 ips)", addrFifth, addrThird)
+	}
+	// clear cache we'll get first again (if we don't get a completely different one that is)
+	fnet.ClearResolveCache()
+	addrAfterCache, err := fnet.Resolve(ctx, "dnstest.fortio.org", "80")
+	if err != nil {
+		t.Errorf("error ip any resolving (6) dnstest.fortio.org: %v", err)
+	}
+	if addrAfterCache.String() == addrFourth.String() {
+		t.Errorf("cache clear failure, we still got 2nd ip: %v", addrAfterCache)
+	}
+	if addrAfterCache.String() != addrThird.String() {
+		log.Warnf("after cache clear we expect to get first %v, we got %v", addrThird, addrAfterCache)
+	}
+	// few extra resolve just for coverage
+	err = fnet.FlagResolveMethod.Set("rnd")
+	if err != nil {
+		t.Errorf("unexpected error setting method to rnd: %v", err)
+	}
+	_, err = fnet.Resolve(ctx, "dnstest.fortio.org", "80")
+	if err != nil {
+		t.Errorf("unexpected error in rnd mode for resolve of dnstest.fortio.org: %v", err)
+	}
+	err = fnet.FlagResolveMethod.Set("rr")
+	if err != nil {
+		t.Errorf("unexpected error setting method to rr: %v", err)
+	}
+	_, err = fnet.Resolve(ctx, "dnstest.fortio.org", "80")
+	if err != nil {
+		t.Errorf("unexpected error in rr mode for resolve of dnstest.fortio.org: %v", err)
+	}
+	// put it back to default
+	err = fnet.FlagResolveMethod.Set("cached-rr")
+	if err != nil {
+		t.Errorf("unexpected error setting method to cached-rr: %v", err)
+	}
+	fnet.FlagResolveIPType.Set("ip4")
+}
+
+func TestDNSCacheConcurrency(t *testing.T) {
+	// Test isn't actually testing unless you use the debugger but coverage shows the extra if
+	// does happen.
+	fnet.FlagResolveIPType.Set("ip")
+	var wg sync.WaitGroup
+	n := 20
+	wg.Add(n)
+	ctx := context.Background()
+	for range n {
+		go func() {
+			fnet.Resolve(ctx, "localhost", "80")
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+	fnet.FlagResolveIPType.Set("ip4")
+	t.Log("TestDNSCacheConcurrency done")
+}
+
+func TestBadValueForDNSMethod(t *testing.T) {
+	err := fnet.FlagResolveMethod.Set("foo")
+	if err == nil {
+		t.Errorf("passing foo to FlagResolveMethod.Set should error out/fail validation")
 	}
 }
 
@@ -575,7 +719,7 @@ func TestReadFileForPayload(t *testing.T) {
 	for _, test := range tests {
 		data, err := fnet.ReadFileForPayload(test.payloadFile)
 		if err != nil && len(test.expectedText) > 0 {
-			t.Errorf("Error should not be happened for ReadFileForPayload")
+			t.Errorf("Error should not be happened for ReadFileForPayload: %v", err)
 		}
 		if !bytes.Equal(data, test.expectedText) {
 			t.Errorf("Got %s, expected %s for ReadFileForPayload()", string(data), string(test.expectedText))
@@ -622,24 +766,31 @@ func TestGeneratePayload(t *testing.T) {
 }
 
 func TestDebugSummary(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected string
-	}{
-		{"12345678", "12345678"},
-		{"123456789", "123456789"},
-		{"1234567890", "1234567890"},
-		{"12345678901", "12345678901"},
-		{"123456789012", "12: 1234...9012"},
-		{"1234567890123", "13: 1234...0123"},
-		{"12345678901234", "14: 1234...1234"},
-		{"A\r\000\001\x80\nB", `A\r\x00\x01\x80\nB`},                   // escaping
-		{"A\r\000Xyyyyyyyyy\001\x80\nB", `17: A\r\x00X...\x01\x80\nB`}, // escaping
+	// Tested in new location, rest package but call once for coverage
+	str := fnet.DebugSummary([]byte{0, 1, 2}, 10)
+	if str != `\x00\x01\x02` {
+		t.Errorf("Unexpected escape: %q", str)
 	}
-	for _, tst := range tests {
-		if actual := fnet.DebugSummary([]byte(tst.input), 8); actual != tst.expected {
-			t.Errorf("Got '%s', expected '%s' for DebugSummary(%q)", actual, tst.expected, tst.input)
-		}
+}
+
+func TestResolveIP6(t *testing.T) {
+	a, err := fnet.ResolveAll(context.Background(), "[::1]", "ip")
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	if len(a) != 1 {
+		t.Errorf("Unexpected number of addresses: %d", len(a))
+	}
+	aStr := a[0].String()
+	if aStr != "::1" {
+		t.Errorf("Unexpected address: %s", aStr)
+	}
+}
+
+func TestResolveNoFilter(t *testing.T) {
+	_, err := fnet.ResolveAll(context.Background(), "localhost", "")
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
 	}
 }
 

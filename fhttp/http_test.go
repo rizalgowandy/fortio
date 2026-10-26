@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright 2017 Fortio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,27 +16,31 @@ package fhttp
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
+	"fortio.org/duration"
 	"fortio.org/fortio/fnet"
-	"fortio.org/fortio/log"
+	"fortio.org/fortio/jrpc"
+	"fortio.org/log"
 	"github.com/google/uuid"
 )
 
 var uuids map[string]bool
 
 func init() {
-	log.SetLogLevel(log.Debug)
 	uuids = map[string]bool{}
 }
 
@@ -66,13 +70,22 @@ func TestGetHeaders(t *testing.T) {
 	if err == nil {
 		t.Errorf("Expected error for header without value, did not get one")
 	}
-	o.ResetHeaders()
+	o.InitHeaders()
 	h = o.AllHeaders()
 	if h.Get("Host") != "" {
 		t.Errorf("After reset Host header should be nil, got '%v'", h.Get("Host"))
 	}
+	if len(h) != 1 {
+		t.Errorf("Header count mismatch after reset, got %d instead of 1. %+v", len(h), h)
+	}
+	// test user-agent delete:
+	o.AddAndValidateExtraHeader("UsER-AgENT:")
+	h = o.AllHeaders()
 	if len(h) != 0 {
-		t.Errorf("Header count mismatch after reset, got %d instead of 1", len(h))
+		t.Errorf("Header count mismatch after delete, got %d instead of 0. %+v", len(h), h)
+	}
+	if h.Get("User-Agent") != "" {
+		t.Errorf("User-Agent header should be empty after delete, got '%v'", h.Get("User-Agent"))
 	}
 }
 
@@ -94,6 +107,18 @@ func TestNewHTTPRequest(t *testing.T) {
 	}
 }
 
+func TestPayloadUTF8(t *testing.T) {
+	opts := HTTPOptions{}
+	opts.Payload = fnet.GenerateRandomPayload(1024)
+	res := opts.PayloadUTF8()
+	if l := len(res); l != 1024 {
+		t.Errorf("Unexpected length %d", l)
+	}
+	if !utf8.ValidString(res) {
+		t.Errorf("PayloadUTF8() not returning valid utf-8 string")
+	}
+}
+
 func TestMultiInitAndEscape(t *testing.T) {
 	// 2 escaped already
 	o := NewHTTPOptions("localhost%3A8080/?delay=10ms:10,0.5s:15%25,0.25s:5")
@@ -102,7 +127,7 @@ func TestMultiInitAndEscape(t *testing.T) {
 	if o.URL != expected {
 		t.Errorf("Got initially '%s', expected '%s'", o.URL, expected)
 	}
-	o.AddAndValidateExtraHeader("FoO: BaR")
+	o.AddAndValidateExtraHeader("FoO:BaR")
 	// re init should not erase headers
 	o.Init(o.URL)
 	if o.AllHeaders().Get("Foo") != "BaR" {
@@ -114,26 +139,22 @@ func TestSchemeCheck(t *testing.T) {
 	tests := []struct {
 		input  string
 		output string
-		stdcli bool
 	}{
-		{"https://www.google.com/", "https://www.google.com/", true},
-		{"www.google.com", "http://www.google.com", false},
-		{"hTTps://foo.bar:123/ab/cd", "hTTps://foo.bar:123/ab/cd", true}, // not double http:
-		{"HTTP://foo.bar:124/ab/cd", "HTTP://foo.bar:124/ab/cd", false},  // not double http:
-		{"", "", false},                      // and error in the logs
-		{"x", "http://x", false},             // should not crash because url is shorter than prefix
-		{"http:/", "http://http:/", false},   // boundary
-		{"http://", "http://", false},        // boundary
-		{"https://", "https://", true},       // boundary
-		{"https:/", "http://https:/", false}, // boundary
+		{"https://www.google.com/", "https://www.google.com/"},
+		{"www.google.com", "http://www.google.com"},
+		{"hTTps://foo.bar:123/ab/cd", "hTTps://foo.bar:123/ab/cd"}, // not double http:
+		{"HTTP://foo.bar:124/ab/cd", "HTTP://foo.bar:124/ab/cd"},   // not double http:
+		{"", ""},                             // and error in the logs
+		{"x", "http://x"},                    // should not crash because url is shorter than prefix
+		{"http:/", "http://http:/"},          // boundary
+		{fnet.PrefixHTTP, fnet.PrefixHTTP},   // boundary
+		{fnet.PrefixHTTPS, fnet.PrefixHTTPS}, // boundary
+		{"https:/", "http://https:/"},        // boundary
 	}
 	for _, tst := range tests {
 		o := NewHTTPOptions(tst.input)
 		if o.URL != tst.output {
 			t.Errorf("Got %v, expecting %v for url '%s'", o.URL, tst.output, tst.input)
-		}
-		if o.DisableFastClient != tst.stdcli {
-			t.Errorf("Got %v, expecting %v for stdclient for url '%s'", o.DisableFastClient, tst.stdcli, tst.input)
 		}
 	}
 }
@@ -182,11 +203,11 @@ func TestFoldFind1(t *testing.T) {
 func TestFoldFind2(t *testing.T) {
 	var haystack [1]byte
 	var needle [1]byte
-	// we don't mind for these to map to eachother in exchange for 30% perf gain
+	// we don't mind for these to map to each other in exchange for 30% perf gain
 	okExceptions := "@[\\]^_`{|}~"
-	for i := 0; i < 127; i++ { // skipping 127 too, matches _
+	for i := range 127 { // skipping 127 too, matches _
 		haystack[0] = byte(i)
-		for j := 0; j < 128; j++ {
+		for j := range 128 {
 			needle[0] = byte(j)
 			sh := string(haystack[:])
 			sn := string(needle[:])
@@ -243,7 +264,7 @@ func TestASCIIToUpper(t *testing.T) {
 func TestParseDecimal(t *testing.T) {
 	tests := []struct {
 		input    string // input
-		expected int    // output
+		expected int64  // output
 	}{
 		{"", -1},
 		{"3", 3},
@@ -264,8 +285,8 @@ func TestParseDecimal(t *testing.T) {
 func TestParseChunkSize(t *testing.T) {
 	tests := []struct {
 		input     string // input
-		expOffset int    // expected offset
-		expValue  int    // expected value
+		expOffset int64  // expected offset
+		expValue  int64  // expected value
 	}{
 		// Errors :
 		{"", 0, -1},
@@ -424,7 +445,7 @@ func TestGenerateStatusDistribution(t *testing.T) {
 	log.SetLogLevel(log.Info)
 	str := "501:20,502:30,503:0.5"
 	m := make(map[int]int)
-	for i := 0; i < 10000; i++ {
+	for range 10000 {
 		m[generateStatus(str)]++
 	}
 	if len(m) != 4 {
@@ -460,8 +481,9 @@ func TestRoundDuration(t *testing.T) {
 		{1299 * time.Millisecond, 1300 * time.Millisecond},
 	}
 	for _, tst := range tests {
-		if actual := RoundDuration(tst.input); actual != tst.expected {
-			t.Errorf("Got %v, expected %v for RoundDuration(%v)", actual, tst.expected, tst.input)
+		expected := duration.Duration(tst.expected)
+		if actual := RoundDuration(tst.input); actual != expected {
+			t.Errorf("Got %v, expected %v for RoundDuration(%v)", actual, expected, tst.input)
 		}
 	}
 }
@@ -519,6 +541,28 @@ func TestGenerateClose(t *testing.T) {
 	}
 }
 
+func TestGenerateGzip(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected bool
+	}{
+		// not numbers
+		{"true", true},
+		{"false", false},
+		{"x", true},
+		// Numbers
+		{"0", false},
+		{"0.0", false},
+		{"99.9999999", true}, // well, in theory this should fail once in a blue moon
+		{"100", true},
+	}
+	for _, tst := range tests {
+		if actual := generateGzip(tst.input); actual != tst.expected {
+			t.Errorf("Got %v, expected %v for generateGzip(%q)", actual, tst.expected, tst.input)
+		}
+	}
+}
+
 func TestPayloadWithEchoBack(t *testing.T) {
 	tests := []struct {
 		payload           []byte
@@ -532,12 +576,13 @@ func TestPayloadWithEchoBack(t *testing.T) {
 	m, a := DynamicHTTPServer(false)
 	m.HandleFunc("/", EchoHandler)
 	url := fmt.Sprintf("http://localhost:%d/", a.Port)
+	ctx := context.Background()
 	for _, test := range tests {
 		opts := NewHTTPOptions(url)
 		opts.DisableFastClient = test.disableFastClient
 		opts.Payload = test.payload
 		cli, _ := NewClient(opts)
-		code, body, header := cli.Fetch()
+		code, body, header := cli.Fetch(ctx)
 		if code != 200 {
 			t.Errorf("Unexpected error %d", code)
 		}
@@ -547,6 +592,22 @@ func TestPayloadWithEchoBack(t *testing.T) {
 		if !test.disableFastClient {
 			cli.Close()
 		}
+	}
+}
+
+// Exercise the code for https://github.com/fortio/fortio/pull/914
+func TestReadtimeout(t *testing.T) {
+	// in theory we'd also redirect the log output to check we do see "Timeout error (incomplete/invalid response)"
+	// but the logger has its own tests and the switch from not covered to covered shows it's working/exercised by this test.
+	m, a := DynamicHTTPServer(false)
+	m.HandleFunc("/", EchoHandler)
+	url := fmt.Sprintf("http://localhost:%d/?delay=1s", a.Port)
+	opts := NewHTTPOptions(url)
+	opts.HTTPReqTimeOut = 100 * time.Millisecond
+	cli, _ := NewClient(opts)
+	code, _, _ := cli.Fetch(context.Background())
+	if code != -1 {
+		t.Errorf("Unexpected code %d", code)
 	}
 }
 
@@ -561,9 +622,9 @@ func TestPayloadWithStdClientAndClosedSocket(t *testing.T) {
 	opts.DisableFastClient = true
 	opts.Payload = payload
 	cli, _ := NewClient(opts)
-
-	for i := 0; i < 3; i++ {
-		code, body, header := cli.Fetch()
+	ctx := context.Background()
+	for range 3 {
+		code, body, header := cli.Fetch(ctx)
 
 		if code != 200 {
 			t.Errorf("Unexpected http status code, expected 200, got %d", code)
@@ -575,7 +636,7 @@ func TestPayloadWithStdClientAndClosedSocket(t *testing.T) {
 	}
 }
 
-// Many of the earlier http tests are through httprunner but new tests should go here
+// Many of the earlier HTTP tests are through httprunner but new tests should go here
 
 func TestUnixDomainHttp(t *testing.T) {
 	uds := fnet.GetUniqueUnixDomainPath("fortio-http-test-uds")
@@ -583,9 +644,9 @@ func TestUnixDomainHttp(t *testing.T) {
 	if addr == nil {
 		t.Fatalf("Error for Serve for %s", uds)
 	}
-	o := HTTPOptions{UnixDomainSocket: uds, URL: "http://foo.bar:123/debug1"}
+	o := HTTPOptions{TLSOptions: TLSOptions{UnixDomainSocket: uds}, URL: "http://foo.bar:123/debug1"}
 	client, _ := NewClient(&o)
-	code, data, _ := client.Fetch()
+	code, data, _ := client.Fetch(context.Background())
 	if code != http.StatusOK {
 		t.Errorf("Got error %d fetching uds %s", code, uds)
 	}
@@ -600,12 +661,12 @@ func TestEchoBack(t *testing.T) {
 	v := url.Values{}
 	v.Add("foo", "bar")
 	url := fmt.Sprintf("http://localhost:%d/?delay=2s", a.Port) // trigger max delay
-	resp, err := http.PostForm(url, v)                          // nolint: noctx // it's just a test!
+	resp, err := http.PostForm(url, v)
 	if err != nil {
 		t.Fatalf("post form err %v", err)
 	}
 	defer resp.Body.Close()
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("readall err %v", err)
 	}
@@ -623,7 +684,7 @@ func TestH10Cli(t *testing.T) {
 	opts.HTTP10 = true
 	opts.AddAndValidateExtraHeader("Host: mhostname")
 	cli, _ := NewFastClient(opts)
-	code, _, _ := cli.Fetch()
+	code, _, _ := cli.Fetch(context.Background())
 	if code != 200 {
 		t.Errorf("http 1.0 unexpected error %d", code)
 	}
@@ -637,21 +698,30 @@ func TestH10Cli(t *testing.T) {
 func TestSmallBufferAndNoKeepAlive(t *testing.T) {
 	m, a := DynamicHTTPServer(false)
 	m.HandleFunc("/", EchoHandler)
+	oldBufferSizeKb := BufferSizeKb
 	BufferSizeKb = 16
+	t.Cleanup(func() { BufferSizeKb = oldBufferSizeKb })
 	sz := BufferSizeKb * 1024
 	url := fmt.Sprintf("http://localhost:%d/?size=%d", a.Port, sz+1) // trigger buffer problem
 	opts := NewHTTPOptions(url)
 	cli, _ := NewFastClient(opts)
-	_, data, _ := cli.Fetch()
+	code, data, _ := cli.Fetch(context.Background())
+	if code != http.StatusOK {
+		t.Errorf("config1: expected first fetch to return 200, got %d", code)
+	}
 	recSz := len(data)
 	if recSz > sz {
 		t.Errorf("config1: was expecting truncated read, got %d", recSz)
+	}
+	code, _, _ = cli.Fetch(context.Background())
+	if code != http.StatusOK {
+		t.Errorf("config1: expected second fetch to return 200, got %d", code)
 	}
 	cli.Close()
 	// Same test without keepalive (exercises a different path)
 	opts.DisableKeepAlive = true
 	cli, _ = NewFastClient(opts)
-	_, data, _ = cli.Fetch()
+	_, data, _ = cli.Fetch(context.Background())
 	recSz = len(data)
 	if recSz > sz {
 		t.Errorf("config2: was expecting truncated read, got %d", recSz)
@@ -659,7 +729,7 @@ func TestSmallBufferAndNoKeepAlive(t *testing.T) {
 	cli.Close()
 }
 
-func TestBadUrl(t *testing.T) {
+func TestBadUrlFastClient(t *testing.T) {
 	opts := NewHTTPOptions("not a valid url")
 	cli, err := NewFastClient(opts)
 	if cli != nil || err == nil {
@@ -674,16 +744,38 @@ func TestBadUrl(t *testing.T) {
 	}
 }
 
+func TestBadURLStdClient(t *testing.T) {
+	opts := NewHTTPOptions("not a valid url")
+	cli, err := NewStdClient(opts)
+	if cli != nil || err == nil {
+		t.Errorf("config1: got a client %v despite bogus url %q", cli, opts.URL)
+		cli.Close()
+	}
+	opts.URL = "http://doesnotexist.fortio.org"
+	cli, err = NewStdClient(opts)
+	if cli != nil || err == nil {
+		t.Errorf("config2: got a client %v despite bogus host in url %q", cli, opts.URL)
+		cli.Close()
+	}
+	opts.URL = ""
+	cli, err = NewStdClient(opts)
+	if cli != nil || err == nil {
+		t.Errorf("config3: got a client %v despite empty url %q", cli, opts.URL)
+		cli.Close()
+	}
+}
+
 func TestDefaultPort(t *testing.T) {
-	// TODO: change back to fortio demo server once setup
-	url := "http://istio.io/" // shall imply port 80
+	url := "http://demo.fortio.org/" // shall imply port 80
 	opts := NewHTTPOptions(url)
 	cli, _ := NewFastClient(opts)
-	code, _, _ := cli.Fetch()
-	if code != 301 {
-		t.Errorf("unexpected code for %s: %d (expecting 301 redirect to https)", url, code)
+	ctx := context.Background()
+	code, _, _ := cli.Fetch(ctx)
+	expectedRedirect := 303 // might need to change if switching from cloudflare to native fortio proxy.
+	if code != expectedRedirect {
+		t.Errorf("unexpected code for %s: %d (expecting %d redirect to https)", url, code, expectedRedirect)
 	}
-	conn := cli.(*FastClient).connect()
+	conn, _ := cli.(*FastClient).connect(ctx)
 	if conn != nil {
 		p := conn.RemoteAddr().(*net.TCPAddr).Port
 		if p != 80 {
@@ -694,19 +786,16 @@ func TestDefaultPort(t *testing.T) {
 		t.Errorf("unable to connect to %s", url)
 	}
 	cli.Close()
-	opts.URL = "https://fortio.org" // will be https port 443
-	opts.Insecure = true            // not needed as we have valid certs but to exercise that code
-	cli, err := NewFastClient(opts)
-	if cli != nil || err == nil {
-		// If https support was added, remove this whitebox/for coverage purpose assertion
-		t.Errorf("fast client isn't supposed to support https (yet), got %v", cli)
-	}
-	cli, err = NewClient(opts)
+	opts = NewHTTPOptions("https://fortio.org") // will be https port 443
+	opts.Insecure = true                        // not needed as we have valid certs but to exercise that code
+	cli, err := NewClient(opts)
 	if cli == nil {
 		t.Fatalf("Couldn't get a client using NewClient on modified opts: %v", err)
 	}
-	// currently fast client fails with https:
-	code, _, _ = cli.Fetch()
+	if !cli.HasBuffer() {
+		t.Errorf("didn't get expected fast client with buffer")
+	}
+	code, _, _ = cli.Fetch(context.Background())
 	if code != 200 {
 		t.Errorf("Standard client http error code %d", code)
 	}
@@ -732,7 +821,7 @@ func TestNoFirstChunkSizeInitially(t *testing.T) {
 	url := fmt.Sprintf("http://localhost:%d/delayedChunkedSize", a.Port)
 	o := HTTPOptions{URL: url}
 	client, _ := NewClient(&o)
-	code, data, header := client.Fetch() // used to panic/bug #127
+	code, data, header := client.Fetch(context.Background()) // used to panic/bug #127
 	t.Logf("delayedChunkedSize result code %d, data len %d, headerlen %d", code, len(data), header)
 	if code != 200 {
 		t.Errorf("Got %d instead of 200", code)
@@ -740,6 +829,33 @@ func TestNoFirstChunkSizeInitially(t *testing.T) {
 	expected := "17\r\n" + testBody + "\r\n0\r\n\r\n" // 17 is hex size of testBody
 	if string(data[header:]) != expected {
 		t.Errorf("Got %s not as expected %q at offset %d", DebugSummary(data, 256), expected, header)
+	}
+}
+
+func oversizedChunks(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Has("later") {
+		w.Write([]byte("a"))
+		w.(http.Flusher).Flush()
+	}
+	w.Write(make([]byte, 8*1024)) // single 8k chunk, larger than the 4k buffer
+}
+
+func TestFastClientOversizedChunks(t *testing.T) {
+	oldBufferSizeKb := BufferSizeKb
+	BufferSizeKb = 4
+	defer func() { BufferSizeKb = oldBufferSizeKb }()
+	m, a := DynamicHTTPServer(false)
+	m.HandleFunc("/", oversizedChunks)
+	for _, query := range []string{"", "?later"} {
+		o := NewHTTPOptions(fmt.Sprintf("http://localhost:%d/%s", a.Port, query))
+		o.HTTPReqTimeOut = time.Second
+		client, _ := NewFastClient(o)
+		for i := range 2 { // first chunk used to spin forever, later chunk used to break the next request
+			if code, _, _ := client.Fetch(context.Background()); code != http.StatusOK {
+				t.Errorf("%q fetch %d: got %d instead of 200", query, i, code)
+			}
+		}
+		client.Close()
 	}
 }
 
@@ -755,7 +871,7 @@ func TestInvalidRequest(t *testing.T) {
 	}
 	client.ChangeURL(" http://bad.url.with.space.com/") // invalid url
 	// should not crash (issue #93), should error out
-	code, _, _ := client.Fetch()
+	code, _, _ := client.Fetch(context.Background())
 	if code != -1 {
 		t.Errorf("Got %d code while expecting -1 (local error)", code)
 	}
@@ -773,7 +889,7 @@ func TestPayloadSizeSmall(t *testing.T) {
 		url := fmt.Sprintf("http://localhost:%d/with-size?size=%d", a.Port, size)
 		o := HTTPOptions{URL: url}
 		client, _ := NewClient(&o)
-		code, data, header := client.Fetch() // used to panic/bug #127
+		code, data, header := client.Fetch(context.Background()) // used to panic/bug #127
 		t.Logf("TestPayloadSize result code %d, data len %d, headerlen %d", code, len(data), header)
 		if code != http.StatusOK {
 			t.Errorf("Got %d instead of 200", code)
@@ -807,16 +923,32 @@ func TestPayloadForClient(t *testing.T) {
 			nil,
 			"GET",
 		},
+		{
+			"",
+			[]byte{},
+			"GET",
+		},
+		{
+			"Foo", // once we set a content-type we get a POST instead of GET (alternative to -X)
+			nil,
+			"POST",
+		},
 	}
 	for _, test := range tests {
 		hOptions := HTTPOptions{}
 		hOptions.URL = "www.google.com"
-		hOptions.ContentType = test.contentType
+		err := hOptions.AddAndValidateExtraHeader("conTENT-tYPE: " + test.contentType)
+		if err != nil {
+			t.Errorf("Got error %v adding header", err)
+		}
+		if hOptions.ContentType != test.contentType {
+			t.Errorf("Got %q, expected %q as a content type from header addition", hOptions.ContentType, test.contentType)
+		}
 		hOptions.Payload = test.payload
 		client, _ := NewStdClient(&hOptions)
 		contentType := client.req.Header.Get("Content-Type")
 		if contentType != test.contentType {
-			t.Errorf("Got %s, expected %s as a content type", contentType, test.contentType)
+			t.Errorf("Got %q, expected %q as a content type", contentType, test.contentType)
 		}
 		method := client.req.Method
 		if method != test.expectedMethod {
@@ -829,11 +961,52 @@ func TestPayloadForClient(t *testing.T) {
 			}
 			continue
 		}
-		buf := new(bytes.Buffer)
+		var buf bytes.Buffer // A Buffer needs no initialization. https://pkg.go.dev/bytes#Buffer
 		buf.ReadFrom(body)
 		payload := buf.Bytes()
 		if !bytes.Equal(payload, test.payload) {
 			t.Errorf("Got %s, expected %s as a body", string(payload), string(test.payload))
+		}
+	}
+}
+
+func TestMethodOverride(t *testing.T) {
+	_, addr := ServeTCP("0", "/debug")
+	o := HTTPOptions{URL: fmt.Sprintf("http://localhost:%d/debug", addr.Port), MethodOverride: "FOO"}
+	for _, fastClient := range []bool{true, false} {
+		o.DisableFastClient = !fastClient
+		cli, _ := NewClient(&o)
+		ctx := context.Background()
+		code, data, _ := cli.Fetch(ctx)
+		if code != 200 {
+			t.Errorf("Non ok code %d for debug override method %q", code, o.MethodOverride)
+		}
+		expected := []byte("FOO /debug HTTP/1.1")
+		if !bytes.Contains(data, expected) {
+			t.Errorf("Method not echoed back in fastClient %v client %s (expecting %s)", fastClient, DebugSummary(data, 512), expected)
+		}
+	}
+}
+
+func TestPostFromContentType(t *testing.T) {
+	_, addr := ServeTCP("0", "/debug")
+	o := HTTPOptions{URL: fmt.Sprintf("http://localhost:%d/debug", addr.Port)}
+	o.AddAndValidateExtraHeader("content-type: foo/bar; xyz")
+	for _, fastClient := range []bool{true, false} {
+		o.DisableFastClient = !fastClient
+		cli, _ := NewClient(&o)
+		ctx := context.Background()
+		code, data, _ := cli.Fetch(ctx)
+		if code != 200 {
+			t.Errorf("Non ok code %d for debug override method %q", code, o.MethodOverride)
+		}
+		expected := []byte("POST /debug HTTP/1.1")
+		if !bytes.Contains(data, expected) {
+			t.Errorf("POST not found in fastClient %v client %s (expecting %s)", fastClient, DebugSummary(data, 512), expected)
+		}
+		expected = []byte("Content-Type: foo/bar; xyz")
+		if !bytes.Contains(data, expected) {
+			t.Errorf("Content-type not found in fastClient %v client %s (expecting %s)", fastClient, DebugSummary(data, 512), expected)
 		}
 	}
 }
@@ -848,18 +1021,18 @@ func TestPayloadForFastClient(t *testing.T) {
 			"application/json",
 			[]byte("{\"test\" : \"test\"}"),
 			fmt.Sprintf("POST / HTTP/1.1\r\nHost: www.google.com\r\nContent-Length: 17\r\nContent-Type: "+
-				"application/json\r\nUser-Agent: %s\r\n\r\n{\"test\" : \"test\"}", userAgent),
+				"application/json\r\nUser-Agent: %s\r\n\r\n{\"test\" : \"test\"}", jrpc.UserAgent),
 		},
 		{
 			"application/xml",
 			[]byte("<test test=\"test\">"),
 			fmt.Sprintf("POST / HTTP/1.1\r\nHost: www.google.com\r\nContent-Length: 18\r\nContent-Type: "+
-				"application/xml\r\nUser-Agent: %s\r\n\r\n<test test=\"test\">", userAgent),
+				"application/xml\r\nUser-Agent: %s\r\n\r\n<test test=\"test\">", jrpc.UserAgent),
 		},
 		{
 			"",
 			nil,
-			fmt.Sprintf("GET / HTTP/1.1\r\nHost: www.google.com\r\nUser-Agent: %s\r\n\r\n", userAgent),
+			fmt.Sprintf("GET / HTTP/1.1\r\nHost: www.google.com\r\nUser-Agent: %s\r\n\r\n", jrpc.UserAgent),
 		},
 	}
 	for _, test := range tests {
@@ -883,7 +1056,7 @@ func TestPayloadSizeLarge(t *testing.T) {
 	url := fmt.Sprintf("http://localhost:%d/with-size?size=%d&status=888", a.Port, size)
 	o := HTTPOptions{URL: url, DisableFastClient: true}
 	client, _ := NewClient(&o)
-	code, data, header := client.Fetch() // used to panic/bug #127
+	code, data, header := client.Fetch(context.Background()) // used to panic/bug #127
 	t.Logf("TestPayloadSize result code %d, data len %d, headerlen %d", code, len(data), header)
 	if code != 888 {
 		t.Errorf("Got %d instead of 888", code)
@@ -899,7 +1072,7 @@ func TestUUIDFastClient(t *testing.T) {
 	url := fmt.Sprintf("http://localhost:%d/{uuid}", a.Port)
 	o := HTTPOptions{URL: url, DisableFastClient: false}
 	client, _ := NewClient(&o)
-	code, data, header := client.Fetch()
+	code, data, header := client.Fetch(context.Background())
 	t.Logf("TestPayloadSize result code %d, data len %d, headerlen %d", code, len(data), header)
 	if code != 200 {
 		t.Errorf("Got %d instead of 200", code)
@@ -916,7 +1089,7 @@ func TestUUIDPayloadFastClient(t *testing.T) {
 		Payload:           []byte("[\"{uuid}\", \"{uuid}\"]"),
 	}
 	client, _ := NewClient(&o)
-	code, data, header := client.Fetch()
+	code, data, header := client.Fetch(context.Background())
 	t.Logf("TestPayloadSize result code %d, data len %d, headerlen %d", code, len(data), header)
 	if code != 200 {
 		t.Errorf("Got %d instead of 200", code)
@@ -929,7 +1102,7 @@ func TestQueryUUIDFastClient(t *testing.T) {
 	url := fmt.Sprintf("http://localhost:%d/?uuid={uuid}", a.Port)
 	o := HTTPOptions{URL: url, DisableFastClient: false}
 	client, _ := NewClient(&o)
-	code, data, header := client.Fetch()
+	code, data, header := client.Fetch(context.Background())
 	t.Logf("TestPayloadSize result code %d, data len %d, headerlen %d", code, len(data), header)
 	if code != 200 {
 		t.Errorf("Got %d instead of 200", code)
@@ -940,11 +1113,11 @@ func TestManyUUIDsFastClient(t *testing.T) {
 	m, a := DynamicHTTPServer(false)
 	m.HandleFunc("/", ValidateManyUUID)
 	url := fmt.Sprintf("http://localhost:%d/{uuid}/{uuid}?uuid={uuid}&uuid2={uuid}", a.Port)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		o := HTTPOptions{URL: url, DisableFastClient: false}
 		client, _ := NewClient(&o)
-		for j := 0; j < 3; j++ {
-			code, data, header := client.Fetch()
+		for range 3 {
+			code, data, header := client.Fetch(context.Background())
 			t.Logf("TestPayloadSize result code %d, data len %d, headerlen %d", code, len(data), header)
 			if code != 200 {
 				t.Errorf("Got %d instead of 200", code)
@@ -959,7 +1132,7 @@ func TestBadUUIDFastClient(t *testing.T) {
 	url := fmt.Sprintf("http://localhost:%d/{not_uuid}", a.Port)
 	o := HTTPOptions{URL: url, DisableFastClient: false}
 	client, _ := NewClient(&o)
-	code, data, header := client.Fetch()
+	code, data, header := client.Fetch(context.Background())
 	t.Logf("TestPayloadSize result code %d, data len %d, headerlen %d", code, len(data), header)
 	if code != 400 {
 		t.Errorf("Got %d instead of 400", code)
@@ -972,7 +1145,7 @@ func TestBadQueryUUIDFastClient(t *testing.T) {
 	url := fmt.Sprintf("http://localhost:%d/?uuid={not_uuid}", a.Port)
 	o := HTTPOptions{URL: url, DisableFastClient: false}
 	client, _ := NewClient(&o)
-	code, data, header := client.Fetch()
+	code, data, header := client.Fetch(context.Background())
 	t.Logf("TestPayloadSize result code %d, data len %d, headerlen %d", code, len(data), header)
 	if code != 400 {
 		t.Errorf("Got %d instead of 400", code)
@@ -985,7 +1158,7 @@ func TestUUIDClient(t *testing.T) {
 	url := fmt.Sprintf("http://localhost:%d/{uuid}", a.Port)
 	o := HTTPOptions{URL: url, DisableFastClient: true}
 	client, _ := NewClient(&o)
-	code, data, header := client.Fetch()
+	code, data, header := client.Fetch(context.Background())
 	t.Logf("TestPayloadSize result code %d, data len %d, headerlen %d", code, len(data), header)
 	if code != 200 {
 		t.Errorf("Got %d instead of 200", code)
@@ -1002,7 +1175,7 @@ func TestUUIDPayloadClient(t *testing.T) {
 		Payload:           []byte("[\"{uuid}\", \"{uuid}\"]"),
 	}
 	client, _ := NewClient(&o)
-	code, data, header := client.Fetch()
+	code, data, header := client.Fetch(context.Background())
 	t.Logf("TestPayloadSize result code %d, data len %d, headerlen %d", code, len(data), header)
 	if code != 200 {
 		t.Errorf("Got %d instead of 200", code)
@@ -1015,7 +1188,7 @@ func TestQueryUUIDClient(t *testing.T) {
 	url := fmt.Sprintf("http://localhost:%d/?uuid={uuid}", a.Port)
 	o := HTTPOptions{URL: url, DisableFastClient: true}
 	client, _ := NewClient(&o)
-	code, data, header := client.Fetch()
+	code, data, header := client.Fetch(context.Background())
 	t.Logf("TestPayloadSize result code %d, data len %d, headerlen %d", code, len(data), header)
 	if code != 200 {
 		t.Errorf("Got %d instead of 200", code)
@@ -1026,11 +1199,11 @@ func TestManyUUIDsClient(t *testing.T) {
 	m, a := DynamicHTTPServer(false)
 	m.HandleFunc("/", ValidateManyUUID)
 	url := fmt.Sprintf("http://localhost:%d/{uuid}/{uuid}?uuid={uuid}&uuid2={uuid}", a.Port)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		o := HTTPOptions{URL: url, DisableFastClient: true}
 		client, _ := NewClient(&o)
-		for j := 0; j < 3; j++ {
-			code, data, header := client.Fetch()
+		for range 3 {
+			code, data, header := client.Fetch(context.Background())
 			t.Logf("TestPayloadSize result code %d, data len %d, headerlen %d", code, len(data), header)
 			if code != 200 {
 				t.Errorf("Got %d instead of 200", code)
@@ -1045,7 +1218,7 @@ func TestBadUUIDClient(t *testing.T) {
 	url := fmt.Sprintf("http://localhost:%d/{not_uuid}", a.Port)
 	o := HTTPOptions{URL: url, DisableFastClient: true}
 	client, _ := NewClient(&o)
-	code, data, header := client.Fetch()
+	code, data, header := client.Fetch(context.Background())
 	t.Logf("TestPayloadSize result code %d, data len %d, headerlen %d", code, len(data), header)
 	if code != 400 {
 		t.Errorf("Got %d instead of 400", code)
@@ -1058,41 +1231,58 @@ func TestBadQueryUUIDClient(t *testing.T) {
 	url := fmt.Sprintf("http://localhost:%d/?uuid={not_uuid}", a.Port)
 	o := HTTPOptions{URL: url, DisableFastClient: true}
 	client, _ := NewClient(&o)
-	code, data, header := client.Fetch()
+	code, data, header := client.Fetch(context.Background())
 	t.Logf("TestPayloadSize result code %d, data len %d, headerlen %d", code, len(data), header)
 	if code != 400 {
 		t.Errorf("Got %d instead of 400", code)
 	}
 }
 
+// TestDebugHandlerSortedHeaders tests the headers are sorted but
+// also tests post echo back and gzip handling.
 func TestDebugHandlerSortedHeaders(t *testing.T) {
 	m, a := DynamicHTTPServer(false)
-	m.HandleFunc("/debug", DebugHandler)
-	url := fmt.Sprintf("http://localhost:%d/debug", a.Port)
-	o := HTTPOptions{URL: url, DisableFastClient: true}
+	m.Handle("/debug", Gzip(http.HandlerFunc(DebugHandler))) // same as in Serve()
+	// Debug handler does respect the delay arg but not status, status is always 200
+	url := fmt.Sprintf("http://localhost:%d/debug?delay=500ms&status=555", a.Port)
+	// Trigger transparent compression (which will add Accept-Encoding: gzip header)
+	o := HTTPOptions{URL: url, DisableFastClient: true, Compression: true, Payload: []byte("abcd")}
 	o.AddAndValidateExtraHeader("BBB: bbb")
 	o.AddAndValidateExtraHeader("CCC: ccc")
 	o.AddAndValidateExtraHeader("ZZZ: zzz")
 	o.AddAndValidateExtraHeader("AAA: aaa")
+	// test that headers usually Add (list) but stay in order of being set
+	o.AddAndValidateExtraHeader("BBB: aa2")
+	// test that User-Agent is special, only last value is kept - and replaces the default jrpc.UserAgent
+	o.AddAndValidateExtraHeader("User-Agent: ua1")
+	o.AddAndValidateExtraHeader("User-Agent: ua2")
 	client, _ := NewClient(&o)
-	code, data, header := client.Fetch() // used to panic/bug #127
+	now := time.Now()
+	code, data, header := client.Fetch(context.Background()) // used to panic/bug #127
+	duration := time.Since(now)
 	t.Logf("TestDebugHandlerSortedHeaders result code %d, data len %d, headerlen %d", code, len(data), header)
 	if code != http.StatusOK {
 		t.Errorf("Got %d instead of 200", code)
+	}
+	if duration < 500*time.Millisecond {
+		t.Errorf("Got %s instead of 500ms", duration)
 	}
 	// remove the first line ('Φορτίο version...') from the body
 	body := string(data)
 	i := strings.Index(body, "\n")
 	body = body[i+1:]
-	expected := fmt.Sprintf("\nGET /debug HTTP/1.1\n\n"+
+	expected := fmt.Sprintf("\nPOST /debug?delay=500ms&status=555 HTTP/1.1\n\n"+
 		"headers:\n\n"+
 		"Host: localhost:%d\n"+
 		"Aaa: aaa\n"+
-		"Bbb: bbb\n"+
+		"Accept-Encoding: gzip\n"+
+		"Bbb: bbb,aa2\n"+
 		"Ccc: ccc\n"+
-		"User-Agent: %s\n"+
+		"Content-Length: 4\n"+
+		"Content-Type: application/octet-stream\n"+
+		"User-Agent: ua2\n"+
 		"Zzz: zzz\n\n"+
-		"body:\n\n\n", a.Port, userAgent)
+		"body:\n\nabcd\n", a.Port)
 	if body != expected {
 		t.Errorf("Get body: %s not as expected: %s", body, expected)
 	}
@@ -1114,14 +1304,14 @@ func TestEchoHeaders(t *testing.T) {
 		v.Add("header", pair.key+":"+pair.value)
 	}
 	// minimal manual encoding (only escape the space) + errors for coverage sake
-	var urls []string
+	urls := make([]string, 0, 2)
 	urls = append(urls,
 		fmt.Sprintf("http://localhost:%d/echo?size=10&header=Foo:Bar1&header=Foo:Bar2&header=X:Y&header=Z:abc+def:xyz&header=&header=Foo",
 			a.Port))
 	// proper encoding
 	urls = append(urls, fmt.Sprintf("http://localhost:%d/echo?%s", a.Port, v.Encode()))
 	for _, url := range urls {
-		resp, err := http.Get(url) // nolint: noctx // it's just a test!
+		resp, err := http.Get(url)
 		if err != nil {
 			t.Fatalf("Failed get for %s : %v", url, err)
 		}
@@ -1132,13 +1322,7 @@ func TestEchoHeaders(t *testing.T) {
 		}
 		for _, pair := range headers {
 			got := resp.Header[pair.key]
-			found := false
-			for _, v := range got {
-				if v == pair.value {
-					found = true
-					break // found == good
-				}
-			}
+			found := slices.Contains(got, pair.value)
 			if !found {
 				t.Errorf("Mismatch: got %+v and didn't find \"%s\" for header %s (url %s)", got, pair.value, pair.key, url)
 			}
@@ -1191,7 +1375,7 @@ func TestFetch2(t *testing.T) {
 	}
 }
 
-func TestFetch2Header(t *testing.T) {
+func TestFetch2IncomingHeader(t *testing.T) {
 	mux, addr := ServeTCP("0", "")
 	mux.HandleFunc("/fetch2/", FetcherHandler2)
 	url := fmt.Sprintf("localhost:%d/fetch2/?url=http://localhost:%d/echo%%3fheader%%3dFoo:Bar", addr.Port, addr.Port)
@@ -1201,6 +1385,34 @@ func TestFetch2Header(t *testing.T) {
 	}
 	if !bytes.Contains(data, []byte("Foo: Bar")) {
 		t.Errorf("Result %s doesn't contain expected Foo: Bar header", DebugSummary(data, 1024))
+	}
+}
+
+func TestFetch2OutgoingHeaders(t *testing.T) {
+	mux, addr := ServeTCP("0", "/debug")
+	mux.HandleFunc("/fetch2/", FetcherHandler2)
+	// added &H= and &H=incomplete to cover these 2 error cases
+	url := fmt.Sprintf("localhost:%d/fetch2/?url=http://localhost:%d/debug"+
+		"&H=foo:Bar&payload=a-test&H=&H=IncompleteHeader&H=Content-TYPE:foo/bar42",
+		addr.Port, addr.Port)
+	code, data := Fetch(&HTTPOptions{URL: url, Payload: []byte("a-longer-different-payload")})
+	if code != http.StatusOK {
+		t.Errorf("Got %d %s instead of ok for %s", code, DebugSummary(data, 256), url)
+	}
+	if !bytes.Contains(data, []byte("Foo: Bar")) {
+		t.Errorf("Result %s doesn't contain expected Foo: Bar header", DebugSummary(data, 1024))
+	}
+	if !bytes.Contains(data, []byte("POST /debug HTTP/1.1")) {
+		t.Errorf("Passing payload should mean POST - got %s", DebugSummary(data, 1024))
+	}
+	if !bytes.Contains(data, []byte("body:\n\na-test\n")) {
+		t.Errorf("Passing payload be echoed - got %s", DebugSummary(data, 1024))
+	}
+	if !bytes.Contains(data, []byte("Content-Length: 6\n")) {
+		t.Errorf("Payload length should be the right one - got %s", DebugSummary(data, 1024))
+	}
+	if !bytes.Contains(data, []byte("Content-Type: foo/bar42\n")) {
+		t.Errorf("Payload length should be the right one - got %s", DebugSummary(data, 1024))
 	}
 }
 
@@ -1239,7 +1451,7 @@ func TestServeError(t *testing.T) {
 }
 
 func testCacheHeaderHandler(w http.ResponseWriter, r *http.Request) {
-	LogRequest(r, "testCacheHeader")
+	log.LogRequest(r, "testCacheHeader")
 	CacheOn(w)
 	w.Write([]byte("cache me"))
 }
@@ -1282,6 +1494,22 @@ func TestLogAndCallNoArg(t *testing.T) {
 	}
 }
 
+func TestLogAndCallDeprecated(t *testing.T) {
+	mux, addrN := HTTPServer("test call no arg", "0")
+	called := false
+	mux.HandleFunc("/testing123/logAndCall",
+		LogAndCall("test log and call", func(http.ResponseWriter, *http.Request) { called = true }))
+	addr := addrN.(*net.TCPAddr)
+	url := fmt.Sprintf("localhost:%d/testing123/logAndCall", addr.Port)
+	code, data := Fetch(&HTTPOptions{URL: url})
+	if code != 200 {
+		t.Errorf("error fetching %s: %v %s", url, code, DebugSummary(data, 256))
+	}
+	if !called {
+		t.Errorf("handler side effect not detected")
+	}
+}
+
 func TestRedirector(t *testing.T) {
 	addr := RedirectToHTTPS(":0")
 	relativeURL := "/foo/bar?some=param&anotherone"
@@ -1306,7 +1534,7 @@ func TestRedirector(t *testing.T) {
 var testNeedEscape = "<a href='http://google.com'>link</a>"
 
 func escapeTestHandler(w http.ResponseWriter, r *http.Request) {
-	LogRequest(r, "escapeTestHandler")
+	log.LogRequest(r, "escapeTestHandler")
 	out := NewHTMLEscapeWriter(w)
 	fmt.Fprintln(out, testNeedEscape)
 }
@@ -1335,11 +1563,12 @@ func TestNewHTMLEscapeWriterError(t *testing.T) {
 
 func TestDefaultHeadersAndOptionsInit(t *testing.T) {
 	_, addr := ServeTCP("0", "/debug")
-	// Un initialized http options:
+	// Un initialized HTTP options:
 	o := HTTPOptions{URL: fmt.Sprintf("http://localhost:%d/debug", addr.Port)}
 	o1 := o
 	cli1, _ := NewStdClient(&o1)
-	code, data, _ := cli1.Fetch()
+	ctx := context.Background()
+	code, data, _ := cli1.Fetch(ctx)
 	if code != 200 {
 		t.Errorf("Non ok code %d for debug default fetch1", code)
 	}
@@ -1349,7 +1578,7 @@ func TestDefaultHeadersAndOptionsInit(t *testing.T) {
 	}
 	o2 := o
 	cli2, _ := NewFastClient(&o2)
-	code, data, _ = cli2.Fetch()
+	code, data, _ = cli2.Fetch(ctx)
 	if code != 200 {
 		t.Errorf("Non ok code %d for debug default fetch2", code)
 	}
@@ -1402,7 +1631,7 @@ func TestValidateAndAddBasicAuthentication(t *testing.T) {
 		if err == nil && !test.isCredentialsValid {
 			t.Errorf("Error was not expected for %s", test.o.UserCredentials)
 		}
-		if test.isAuthHeaderAdded && len(h.Get("Authorization")) <= 0 {
+		if test.isAuthHeaderAdded && len(h.Get("Authorization")) == 0 {
 			t.Errorf("Authorization header was expected for %s credentials", test.o.UserCredentials)
 		}
 	}
@@ -1424,7 +1653,7 @@ func TestInsecureRequest(t *testing.T) {
 		o := HTTPOptions{
 			DisableFastClient: tst.fastClient,
 			URL:               expiredURL,
-			Insecure:          tst.insecure,
+			TLSOptions:        TLSOptions{Insecure: tst.insecure},
 		}
 		code, _ := Fetch(&o)
 		if code != tst.code {
@@ -1434,7 +1663,7 @@ func TestInsecureRequest(t *testing.T) {
 }
 
 func TestInsecureRequestWithResolve(t *testing.T) {
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 	srv := httptest.NewTLSServer(handler)
@@ -1455,7 +1684,7 @@ func TestInsecureRequestWithResolve(t *testing.T) {
 		o := HTTPOptions{
 			DisableFastClient: tst.fastClient,
 			URL:               url,
-			Insecure:          tst.insecure,
+			TLSOptions:        TLSOptions{Insecure: tst.insecure},
 			Resolve:           "127.0.0.1",
 		}
 		code, _ := Fetch(&o)
@@ -1465,10 +1694,10 @@ func TestInsecureRequestWithResolve(t *testing.T) {
 	}
 }
 
-// ValidateUUIDPath is an http server handler validating /{uuid}.
+// ValidateUUIDPath is an HTTP server handler validating /{uuid}.
 func ValidateUUIDPath(w http.ResponseWriter, r *http.Request) {
 	if log.LogVerbose() {
-		LogRequest(r, "ValidateUUIDPath")
+		log.LogRequest(r, "ValidateUUIDPath")
 	}
 
 	uuidParam := strings.TrimPrefix(r.URL.Path, "/")
@@ -1482,10 +1711,10 @@ func ValidateUUIDPath(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// ValidateUUIDQueryparam is an http server handler validating /?uuid={uuid}.
+// ValidateUUIDQueryparam is an HTTP server handler validating /?uuid={uuid}.
 func ValidateUUIDQueryParam(w http.ResponseWriter, r *http.Request) {
 	if log.LogVerbose() {
-		LogRequest(r, "ValidateUUIDQueryParam")
+		log.LogRequest(r, "ValidateUUIDQueryParam")
 	}
 
 	uuidParam := r.URL.Query().Get("uuid")
@@ -1499,11 +1728,11 @@ func ValidateUUIDQueryParam(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// ValidateManyUUID is an http server handler validating /{uuid}?uuid={uuid},
-//   including payload in JSON following the format: ["{uuid}","{uuid}"]
+// ValidateManyUUID is an HTTP server handler validating `/{uuid}?uuid={uuid}`,
+// including payload in JSON following the format: ["{uuid}","{uuid}"].
 func ValidateManyUUID(w http.ResponseWriter, r *http.Request) {
 	if log.LogVerbose() {
-		LogRequest(r, "ValidateManyUUID")
+		log.LogRequest(r, "ValidateManyUUID")
 	}
 
 	uuidParams := strings.Split(r.URL.Path, "/")
@@ -1602,13 +1831,13 @@ func asciiFold1(str string) []byte {
 var lw []byte
 
 func BenchmarkASCIIFoldNormalToLower(b *testing.B) {
-	for n := 0; n < b.N; n++ {
+	for b.Loop() {
 		lw = asciiFold0(utf8Str)
 	}
 }
 
 func BenchmarkASCIIFoldCustomToLowerMap(b *testing.B) {
-	for n := 0; n < b.N; n++ {
+	for b.Loop() {
 		lw = asciiFold1(utf8Str)
 	}
 }
@@ -1616,7 +1845,7 @@ func BenchmarkASCIIFoldCustomToLowerMap(b *testing.B) {
 // Package's version (3x fastest).
 func BenchmarkASCIIToUpper(b *testing.B) {
 	log.SetLogLevel(log.Warning)
-	for n := 0; n < b.N; n++ {
+	for b.Loop() {
 		lw = ASCIIToUpper(utf8Str)
 	}
 }
@@ -1648,14 +1877,14 @@ func FoldFind0(haystack []byte, needle []byte) (bool, int) {
 
 func BenchmarkFoldFind0(b *testing.B) {
 	needle := []byte("VARY")
-	for n := 0; n < b.N; n++ {
+	for b.Loop() {
 		FoldFind0(testHaystack, needle)
 	}
 }
 
 func BenchmarkFoldFind(b *testing.B) {
 	needle := []byte("VARY")
-	for n := 0; n < b.N; n++ {
+	for b.Loop() {
 		FoldFind(testHaystack, needle)
 	}
 }

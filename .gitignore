@@ -1,3 +1,6 @@
+# linter config now comes from shared workflows
+.golangci.yml
+coverage.out*
 tmp/
 coverage.txt
 *.bak
@@ -14,3 +17,4 @@ Gopkg.*
 cert-tmp/
 # brew binary bottles create a .brew_home/ dir in source tree
 .brew_home/
+.vscode/

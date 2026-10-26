@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright 2017 Fortio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,47 +13,43 @@
 // limitations under the License.
 
 // Package version for fortio holds version information and build information.
-package version // import "fortio.org/fortio/version"
+// The reusable library part and examples moved to [fortio.org/version].
+package version
+
 import (
-	"runtime"
-
-	"fortio.org/fortio/log"
-)
-
-const (
-	debug = false // turn on to debug init()
+	"fortio.org/version"
 )
 
 var (
-	// The following are set by Dockerfile during link time.
-	buildInfo = "unknown"
-	version   = "dev"
-	// computed in init().
-	longVersion = ""
+	// The following are (re)computed in init().
+	shortVersion = "dev"
+	longVersion  = "unknown long"
+	fullVersion  = "unknown full"
 )
 
-// Short returns the 3 digit short version string Major.Minor.Patch[-pre]
+// Short returns the 3 digit short fortio version string Major.Minor.Patch
+// it matches the project git tag (without the leading v) or "dev" when
+// not built from tag / not `go install fortio.org/fortio@latest`
 // version.Short() is the overall project version (used to version json
-// output too). "-pre" is added when the version doesn't match exactly
-// a git tag or the build isn't from a clean source tree. (only standard
-// dockerfile based build of a clean, tagged source tree should print "X.Y.Z"
-// as short version).
+// output too).
 func Short() string {
-	return version
+	return shortVersion
 }
 
-// Long returns the full version and build information.
-// Format is "X.Y.X[-pre] YYYY-MM-DD HH:MM SHA[-dirty]" date and time is
-// the build date (UTC), sha is the git sha of the source tree.
+// Long returns the long fortio version and build information.
+// Format is "X.Y.X hash go-version processor os".
 func Long() string {
 	return longVersion
 }
 
-// Carefully manually tested all the combinations in pair with Dockerfile.
+// Full returns the Long version + all the run time BuildInfo, ie
+// all the dependent modules and version and hash as well.
+func Full() string {
+	return fullVersion
+}
 
-func init() { // nolint:gochecknoinits //we do need an init for this
-	if debug {
-		log.SetLogLevel(log.Debug)
-	}
-	longVersion = version + " " + buildInfo + " " + runtime.Version()
+// This "burns in" the fortio version. we need to get the "right" versions though.
+// depending if we are a module or main.
+func init() { //nolint:gochecknoinits // we do need an init for this
+	shortVersion, longVersion, fullVersion = version.FromBuildInfoPath("fortio.org/fortio")
 }

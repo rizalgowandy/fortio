@@ -14,14 +14,13 @@
 
 // Tee off traffic
 
-package fhttp // import "fortio.org/fortio/fhttp"
+package fhttp
 
 import (
 	"bufio"
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/textproto"
@@ -30,7 +29,8 @@ import (
 	"sync"
 
 	"fortio.org/fortio/fnet"
-	"fortio.org/fortio/log"
+	"fortio.org/fortio/jrpc"
+	"fortio.org/log"
 )
 
 var (
@@ -45,11 +45,11 @@ var (
 // TargetConf is the structure to configure one of the multiple targets for MultiServer.
 type TargetConf struct {
 	Destination  string // Destination URL or base
-	MirrorOrigin bool   // wether to use the incoming request as URI and data params to outgoing one (proxy like)
+	MirrorOrigin bool   // whether to use the incoming request as URI and data params to outgoing one (proxy like)
 	//	Return       bool   // Will return the result of this target
 }
 
-// MultiServerConfig configures the MultiServer and holds the http client it uses for proxying.
+// MultiServerConfig configures the MultiServer and holds the HTTP client it uses for proxying.
 type MultiServerConfig struct {
 	Targets []TargetConf
 	Serial  bool // Serialize or parallel queries
@@ -60,8 +60,8 @@ type MultiServerConfig struct {
 
 func makeMirrorRequest(baseURL string, r *http.Request, data []byte) *http.Request {
 	url := baseURL + r.RequestURI
-	bodyReader := ioutil.NopCloser(bytes.NewReader(data))
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, url, bodyReader)
+	bodyReader := io.NopCloser(bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, url, bodyReader) //nolint:gosec // mirroring to user configured URL
 	if err != nil {
 		log.Warnf("new mirror request error for %q: %v", url, err)
 		return nil
@@ -72,7 +72,7 @@ func makeMirrorRequest(baseURL string, r *http.Request, data []byte) *http.Reque
 	return req
 }
 
-// CopyHeaders copies all or trace headers.
+// CopyHeaders copies all or trace headers from `r` into `req`.
 func CopyHeaders(req, r *http.Request, all bool) {
 	// Copy only trace headers unless all is true.
 	for k, v := range r.Header {
@@ -85,32 +85,54 @@ func CopyHeaders(req, r *http.Request, all bool) {
 			log.Debugf("Skipping header %q", k)
 		}
 	}
+	if _, ok := r.Header["User-Agent"]; !ok {
+		// explicitly disable User-Agent so it's not set
+		// to default value (go client lib 'feature' workaround)
+		req.Header.Set("User-Agent", "")
+	}
 }
 
 // MakeSimpleRequest makes a new request for url but copies trace headers from input request r.
 // or all the headers if copyAllHeaders is true.
-func MakeSimpleRequest(url string, r *http.Request, copyAllHeaders bool) *http.Request {
-	req, err := http.NewRequestWithContext(r.Context(), "GET", url, nil)
+func MakeSimpleRequest(url string, r *http.Request, copyAllHeaders bool) (*http.Request, *HTTPOptions) {
+	opts := CommonHTTPOptionsFromForm(r)
+	var body io.Reader
+	if len(opts.Payload) > 0 {
+		body = bytes.NewReader(opts.Payload)
+	}
+	req, err := http.NewRequestWithContext(r.Context(), opts.Method(), url, body) //nolint:gosec // forwarding to user configured URL
 	if err != nil {
 		log.Warnf("new request error for %q: %v", url, err)
-		return nil
+		return nil, opts
 	}
 	// Copy only trace headers or all of them:
 	CopyHeaders(req, r, copyAllHeaders)
 	if copyAllHeaders {
-		req.Header.Add("X-Proxy-Agent", userAgent)
+		// Add the headers from the form/query args "H" arguments: (only in trusted/copy all headers mode)
+		for k, v := range opts.extraHeaders {
+			for _, vv := range v {
+				req.Header.Add(k, vv)
+			}
+			log.Debugf("Header %q is now %v", k, req.Header[k])
+		}
+		if opts.ContentType != "" {
+			req.Header.Set("Content-Type", opts.ContentType)
+			log.Debugf("Setting Content-Type to %q", opts.ContentType)
+		}
+		// force correct content length:
+		req.Header.Set("Content-Length", strconv.Itoa(len(opts.Payload)))
 	} else {
-		req.Header.Add("User-Agent", userAgent)
+		req.Header.Set(jrpc.UserAgentHeader, jrpc.UserAgent)
 	}
-	return req
+	return req, opts
 }
 
 // TeeHandler common part between TeeSerialHandler and TeeParallelHandler.
 func (mcfg *MultiServerConfig) TeeHandler(w http.ResponseWriter, r *http.Request) {
 	if log.LogVerbose() {
-		LogRequest(r, mcfg.Name)
+		log.LogRequest(r, mcfg.Name)
 	}
-	data, err := ioutil.ReadAll(r.Body)
+	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Errf("Error reading on %v: %v", r, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -129,14 +151,14 @@ func setupRequest(r *http.Request, i int, t TargetConf, data []byte) *http.Reque
 	if t.MirrorOrigin {
 		req = makeMirrorRequest(t.Destination, r, data)
 	} else {
-		req = MakeSimpleRequest(t.Destination, r, false)
+		req, _ = MakeSimpleRequest(t.Destination, r, false)
 	}
 	if req == nil {
 		// error already logged
 		return nil
 	}
 	OnBehalfOfRequest(req, r)
-	req.Header.Add("X-Fortio-Multi-ID", strconv.Itoa(i+1))
+	req.Header.Add("X-Fortio-Multi-Id", strconv.Itoa(i+1))
 	log.LogVf("Going to %s", req.URL.String())
 	return req
 }
@@ -150,14 +172,16 @@ func (mcfg *MultiServerConfig) TeeSerialHandler(w http.ResponseWriter, r *http.R
 			continue
 		}
 		url := req.URL.String()
+		//nolint:gosec // the url is indeed user provided.
 		resp, err := mcfg.client.Do(req)
 		if err != nil {
 			msg := fmt.Sprintf("Error for %s: %v", url, err)
-			log.Warnf(msg)
+			log.Warnf("%s", msg)
 			if first {
 				w.WriteHeader(http.StatusServiceUnavailable)
 				first = false
 			}
+			//nolint:gosec // the payload is indeed user provided.
 			_, _ = w.Write([]byte(msg))
 			_, _ = w.Write([]byte("\n"))
 			continue
@@ -177,10 +201,11 @@ func (mcfg *MultiServerConfig) TeeSerialHandler(w http.ResponseWriter, r *http.R
 
 func singleRequest(client *http.Client, w io.Writer, req *http.Request, statusPtr *int) {
 	url := req.URL.String()
+	//nolint:gosec // the url is indeed user provided.
 	resp, err := client.Do(req)
 	if err != nil {
 		msg := fmt.Sprintf("Error for %s: %v", url, err)
-		log.Warnf(msg)
+		log.Warnf("%s", msg)
 		_, _ = w.Write([]byte(msg))
 		_, _ = w.Write([]byte{'\n'})
 		*statusPtr = -1
@@ -201,7 +226,7 @@ func (mcfg *MultiServerConfig) TeeParallelHandler(w http.ResponseWriter, r *http
 	numTargets := len(mcfg.Targets)
 	ba := make([]bytes.Buffer, numTargets)
 	sa := make([]int, numTargets)
-	for i := 0; i < numTargets; i++ {
+	for i := range numTargets {
 		req := setupRequest(r, i, mcfg.Targets[i], data)
 		if req == nil {
 			continue
@@ -217,7 +242,7 @@ func (mcfg *MultiServerConfig) TeeParallelHandler(w http.ResponseWriter, r *http
 	wg.Wait()
 	// Get overall status only ok if all OK, first non ok sets status
 	status := http.StatusOK
-	for i := 0; i < numTargets; i++ {
+	for i := range numTargets {
 		if sa[i] != http.StatusOK {
 			status = sa[i]
 			break
@@ -228,7 +253,7 @@ func (mcfg *MultiServerConfig) TeeParallelHandler(w http.ResponseWriter, r *http
 	}
 	w.WriteHeader(status)
 	// Send all the data back to back
-	for i := 0; i < numTargets; i++ {
+	for i := range numTargets {
 		bw, err := w.Write(ba[i].Bytes())
 		log.Debugf("For %d, wrote %d bytes - status %d", i, bw, sa[i])
 		if err != nil {
@@ -238,22 +263,35 @@ func (mcfg *MultiServerConfig) TeeParallelHandler(w http.ResponseWriter, r *http
 	}
 }
 
-// CreateProxyClient http client for connection reuse.
-func CreateProxyClient() *http.Client {
-	client := &http.Client{
-		Transport: &http.Transport{
-			// TODO make configurable, should be fine for now for most but extreme -c values
-			MaxIdleConnsPerHost: 128, // must be more than incoming parallelization; divided by number of fan out if using parallel mode
-			MaxIdleConns:        256,
-		},
+func setClientOptions(client *http.Client, opts *HTTPOptions) {
+	log.Debugf("Setting client options to %+v", opts)
+	client.Timeout = opts.HTTPReqTimeOut
+	tls, _ := opts.TLSConfig()
+	client.Transport = &http.Transport{
+		// TODO make configurable, should be fine for now for most but extreme -c values
+		MaxIdleConnsPerHost: 128, // must be more than incoming parallelization; divided by number of fan out if using parallel mode
+		MaxIdleConns:        256,
+		// This avoids Accept-Encoding: gzip being added to outgoing requests when no encoding accept is specified
+		// yet if passed by request, it will do gzip end to end. Issue #624.
+		DisableCompression:  true,
+		Proxy:               http.ProxyFromEnvironment,
+		TLSHandshakeTimeout: DefaultHTTPOptions.HTTPReqTimeOut,
+		TLSClientConfig:     tls,
 	}
+}
+
+// CreateProxyClient HTTP client for connection reuse.
+func CreateProxyClient() *http.Client {
+	log.Debugf("Creating proxy client")
+	client := &http.Client{}
+	setClientOptions(client, DefaultHTTPOptions)
 	return client
 }
 
-// MultiServer starts fan out http server on the given port.
+// MultiServer starts fan out HTTP server on the given port.
 // Returns the mux and addr where the listening socket is bound.
 // The port can be retrieved from it when requesting the 0 port as
-// input for dynamic http server.
+// input for dynamic HTTP server.
 func MultiServer(port string, cfg *MultiServerConfig) (*http.ServeMux, net.Addr) {
 	hName := cfg.Name
 	if hName == "" {
@@ -274,9 +312,9 @@ func MultiServer(port string, cfg *MultiServerConfig) (*http.ServeMux, net.Addr)
 		if t.MirrorOrigin {
 			t.Destination = strings.TrimSuffix(t.Destination, "/") // remove trailing / because we will concatenate the request URI
 		}
-		if !strings.HasPrefix(t.Destination, "https://") && !strings.HasPrefix(t.Destination, "http://") {
+		if !strings.HasPrefix(t.Destination, fnet.PrefixHTTPS) && !strings.HasPrefix(t.Destination, fnet.PrefixHTTP) {
 			log.Infof("Assuming http:// on missing scheme for '%s'", t.Destination)
-			t.Destination = "http://" + t.Destination
+			t.Destination = fnet.PrefixHTTP + t.Destination
 		}
 	}
 	log.Infof("Multi-server on %s running with %+v", aStr, cfg)

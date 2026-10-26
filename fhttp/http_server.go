@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright 2017 Fortio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package fhttp // import "fortio.org/fortio/fhttp"
+package fhttp
 
 // pprof import to get /debug/pprof endpoints on a mux through SetupPPROF.
+
 import (
 	"bytes"
-	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -28,38 +28,74 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	"fortio.org/fortio/dflag"
+	"fortio.org/dflag"
 	"fortio.org/fortio/fnet"
-	"fortio.org/fortio/log"
+	"fortio.org/fortio/jrpc"
 	"fortio.org/fortio/version"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
+	"fortio.org/log"
 )
 
 // -- Echo Server --
 
 var (
 	// Start time of the server (used in debug handler for uptime).
-	startTime time.Time
+	startTime = time.Now()
 	// EchoRequests is the number of request received. Only updated in Debug mode.
-	EchoRequests int64
-	// TODO find a way to only include this on binaries and not library mode (#433).
-	defaultEchoServerParams = dflag.DynString(flag.CommandLine, "echo-server-default-params", "",
+	EchoRequests            int64
+	DefaultEchoServerParams = dflag.New("",
 		"Default parameters/querystring to use if there isn't one provided explicitly. E.g \"status=404&delay=3s\"")
-	fetch2CopiesAllHeader = dflag.DynBool(flag.CommandLine, "proxy-all-headers", true,
+	Fetch2CopiesAllHeader = dflag.NewBool(true,
 		"Determines if only tracing or all headers (and cookies) are copied from request on the fetch2 ui/server endpoint")
-	serverIdleTimeout = dflag.DynDuration(flag.CommandLine, "server-idle-timeout", 30*time.Second, "Default IdleTimeout for servers")
+	ServerIdleTimeout = dflag.New(30*time.Second, "Default IdleTimeout for servers")
 )
 
-// EchoHandler is an http server handler echoing back the input.
-func EchoHandler(w http.ResponseWriter, r *http.Request) {
-	if log.LogVerbose() {
-		LogRequest(r, "Echo") // will also print headers
+func Flush(w http.ResponseWriter) {
+	f, ok := w.(http.Flusher)
+	if ok {
+		f.Flush()
 	}
-	defaultParams := defaultEchoServerParams.Get()
+}
+
+type FlushWriter struct {
+	w http.ResponseWriter
+}
+
+func (fw FlushWriter) Write(p []byte) (n int, err error) {
+	n, err = fw.w.Write(p)
+	log.Debugf("FlushWriter wrote %d", n)
+	Flush(fw.w)
+	return n, err
+}
+
+// QueryArg(r,...) is like r.FormValue(...) but exclusively
+// getting the values from the query string (as we use the body for data).
+// Result of parsing the query string is cached in r.Form so we don't keep
+// parsing it and so r.Form can be used for multivalued entries like r.Form["header"].
+func QueryArg(r *http.Request, key string) string {
+	if r.Form == nil {
+		r.Form = r.URL.Query()
+	}
+	return r.Form.Get(key)
+}
+
+// EchoHandler is an HTTP server handler echoing back the input.
+func EchoHandler(w http.ResponseWriter, r *http.Request) {
+	// EchoHandler is an HTTP server handler echoing back the input.
+	if log.LogVerbose() {
+		log.LogAndCall("Echo", func(w http.ResponseWriter, r *http.Request) {
+			echoHandler(w, r)
+		})(w, r)
+		return
+	}
+	echoHandler(w, r)
+}
+
+func echoHandler(w http.ResponseWriter, r *http.Request) {
+	defaultParams := DefaultEchoServerParams.Get()
 	hasQuestionMark := strings.Contains(r.RequestURI, "?")
 	if !hasQuestionMark && len(defaultParams) > 0 {
 		newQS := r.RequestURI + "?" + defaultParams
@@ -74,31 +110,79 @@ func EchoHandler(w http.ResponseWriter, r *http.Request) {
 			r = &nr
 		}
 	}
-	data, err := ioutil.ReadAll(r.Body) // must be done before calling FormValue
-	if err != nil {
-		log.Errf("Error reading %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	log.Debugf("Read %d", len(data))
-	dur := generateDelay(r.FormValue("delay"))
-	if dur > 0 {
-		log.LogVf("Sleeping for %v", dur)
-		time.Sleep(dur)
-	}
-	statusStr := r.FormValue("status")
+	reqNum := handleCommonArgs(w, r)
+	statusStr := QueryArg(r, "status")
 	var status int
 	if statusStr != "" {
 		status = generateStatus(statusStr)
 	} else {
 		status = http.StatusOK
 	}
+	gzip := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") && generateGzip(QueryArg(r, "gzip"))
+	if gzip {
+		gwz := NewGzipHTTPResponseWriter(w)
+		defer gwz.Close()
+		w = gwz
+	}
+	size := generateSize(QueryArg(r, "size")) // -1 means no size/payload mode
+	var data []byte
+	var err error
+	// Also read the whole input if we're supposed to write something unrelated like size=100
+	h2Mode := (r.ProtoMajor == 2) && (!gzip) && (size == -1)
+	if !h2Mode {
+		data, err = io.ReadAll(r.Body)
+		log.Debugf("H1(.1) read %d", len(data))
+		if err != nil {
+			log.Errf("Error reading body: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	if size >= 0 {
+		log.LogVf("Writing %d size with %d status", size, status)
+		writePayload(w, status, size)
+		return
+	}
+	// echo back the Content-Type and Content-Length in the response
+	for _, k := range []string{"Content-Type", "Content-Length"} {
+		if v := r.Header.Get(k); v != "" {
+			jrpc.SetHeaderIfMissing(w.Header(), k, v)
+		}
+	}
+	if reqNum > 0 {
+		jrpc.SetHeaderIfMissing(w.Header(), "x-fortio-id", strconv.FormatInt(reqNum, 10))
+	}
+	w.WriteHeader(status)
+	if h2Mode {
+		// h2 non gzip, non size case: stream the body back
+		var n int64
+		n, err = io.Copy(FlushWriter{w}, r.Body)
+		log.Debugf("H2 read/Copied %d", n)
+		if err != nil {
+			log.Errf("Error copying from body to output: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	} else {
+		if _, err = w.Write(data); err != nil {
+			log.Errf("Error writing response %v to %v", err, r.RemoteAddr)
+		}
+	}
+}
+
+// handleCommonArgs common flags for debug and echo handlers from query string only.
+func handleCommonArgs(w http.ResponseWriter, r *http.Request) (rqNum int64) {
+	dur := generateDelay(QueryArg(r, "delay"))
+	if dur > 0 {
+		log.LogVf("Sleeping for %v", dur)
+		time.Sleep(dur)
+	}
 	if log.LogDebug() {
-		// TODO: this easily lead to contention - use 'thread local'
-		rqNum := atomic.AddInt64(&EchoRequests, 1)
+		// Note this easily lead to contention, debug mode only (or low qps).
+		rqNum = atomic.AddInt64(&EchoRequests, 1)
 		log.Debugf("Request # %v", rqNum)
 	}
-	if generateClose(r.FormValue("close")) {
+	if generateClose(QueryArg(r, "close")) {
 		log.Debugf("Adding Connection:close / will close socket")
 		w.Header().Set("Connection", "close")
 	}
@@ -115,26 +199,11 @@ func EchoHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Add(s[0], s[1])
 	}
-	size := generateSize(r.FormValue("size"))
-	if size >= 0 {
-		log.LogVf("Writing %d size with %d status", size, status)
-		writePayload(w, status, size)
-		return
-	}
-	// echo back the Content-Type and Content-Length in the response
-	for _, k := range []string{"Content-Type", "Content-Length"} {
-		if v := r.Header.Get(k); v != "" {
-			w.Header().Set(k, v)
-		}
-	}
-	w.WriteHeader(status)
-	if _, err = w.Write(data); err != nil {
-		log.Errf("Error writing response %v to %v", err, r.RemoteAddr)
-	}
+	return rqNum // rqNum ie 0 most of the time
 }
 
 func writePayload(w http.ResponseWriter, status int, size int) {
-	w.Header().Set("Content-Type", "application/octet-stream")
+	jrpc.SetHeaderIfMissing(w.Header(), "Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.Itoa(size))
 	w.WriteHeader(status)
 	n, err := w.Write(fnet.Payload[:size])
@@ -162,18 +231,30 @@ func closingServer(listener net.Listener) error {
 	return err
 }
 
-// HTTPServer creates an http server named name on address/port port.
+// HTTPServer creates an HTTP server named name on address/port.
 // Port can include binding address and/or be port 0.
 func HTTPServer(name string, port string) (*http.ServeMux, net.Addr) {
 	m := http.NewServeMux()
-	h2s := &http2.Server{}
+	return m, HTTPServerWithHandler(name, port, m)
+}
+
+// HTTPServerWithHandler creates and h2c compatible server named name on address/port.
+// Port can include binding address and/or be port 0.
+// Takes in a handler.
+func HTTPServerWithHandler(name string, port string, hdlr http.Handler) net.Addr {
 	s := &http.Server{
-		IdleTimeout: serverIdleTimeout.Get(),
-		Handler:     h2c.NewHandler(m, h2s),
+		ReadHeaderTimeout: ServerIdleTimeout.Get(),
+		IdleTimeout:       ServerIdleTimeout.Get(),
+		Handler:           hdlr,
+		ErrorLog:          log.NewStdLogger("http2c srv "+name, log.Error),
 	}
+	s.Protocols = new(http.Protocols)
+	s.Protocols.SetHTTP1(true)
+	s.Protocols.SetHTTP2(true)
+	s.Protocols.SetUnencryptedHTTP2(true)
 	listener, addr := fnet.Listen(name, port)
 	if listener == nil {
-		return nil, nil // error already logged
+		return nil // error already logged
 	}
 	go func() {
 		err := s.Serve(listener)
@@ -181,40 +262,63 @@ func HTTPServer(name string, port string) (*http.ServeMux, net.Addr) {
 			log.Fatalf("Unable to serve %s on %s: %v", name, addr.String(), err)
 		}
 	}()
+	return addr
+}
+
+func HTTPSServer(name string, port string, to *TLSOptions) (*http.ServeMux, net.Addr) {
+	listener, addr := fnet.Listen(name, port)
+	if listener == nil {
+		return nil, nil // error already logged
+	}
+	m := http.NewServeMux()
+	tlsConfig, err := to.TLSConfig()
+	if err != nil {
+		return nil, nil
+	}
+	s := &http.Server{
+		ReadHeaderTimeout: ServerIdleTimeout.Get(),
+		IdleTimeout:       ServerIdleTimeout.Get(),
+		Handler:           m,
+		TLSConfig:         tlsConfig,
+		ErrorLog:          log.NewStdLogger("http srv "+name, log.Error),
+	}
+	go func() {
+		err := s.ServeTLS(listener, to.Cert, to.Key)
+		if err != nil {
+			log.Fatalf("Unable to TLS serve %s on %s: %v", name, addr.String(), err)
+		}
+	}()
 	return m, addr
 }
 
-// DynamicHTTPServer listens on an available port, sets up an http or a closing
-// server simulating an https server (when closing is true) server on it and
+// DynamicHTTPServer listens on an available port, sets up an HTTP or a closing
+// server simulating an HTTPS server (when closing is true) server on it and
 // returns the listening port and mux to which one can attach handlers to.
 // Note: in a future version of istio, the closing will be actually be secure
-// on/off and create an https server instead of a closing server.
-// As this is a dynamic tcp socket server, the address is TCP.
+// on/off and create an HTTPS server instead of a closing server.
+// As this is a dynamic TCP socket server, the address is TCP.
 func DynamicHTTPServer(closing bool) (*http.ServeMux, *net.TCPAddr) {
 	if !closing {
 		mux, addr := HTTPServer("dynamic", "0")
 		return mux, addr.(*net.TCPAddr)
 	}
 	// Note: we actually use the fact it's not supported as an error server for tests - need to change that
-	log.Errf("Secure setup not yet supported. Will just close incoming connections for now")
+	log.Warnf("Closing server requested (for error testing)")
 	listener, addr := fnet.Listen("closing server", "0")
-	// err = http.ServeTLS(listener, nil, "", "") // go 1.9
 	go func() {
-		err := closingServer(listener)
-		if err != nil {
-			log.Fatalf("Unable to serve closing server on %s: %v", addr.String(), err)
-		}
+		// closingServer only returns on error.
+		log.Fatalf("Unable to serve closing server on %s: %v", addr.String(), closingServer(listener))
 	}()
 	return nil, addr.(*net.TCPAddr)
 }
 
 /*
-// DebugHandlerTemplate returns debug/useful info on the http requet.
+// DebugHandlerTemplate returns debug/useful info on the HTTP request.
 // slower heavier but nicer source code version of DebugHandler
 func DebugHandlerTemplate(w http.ResponseWriter, r *http.Request) {
 	log.LogVf("%v %v %v %v", r.Method, r.URL, r.Proto, r.RemoteAddr)
 	hostname, _ := os.Hostname()
-	data, err := ioutil.ReadAll(r.Body)
+	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Errf("Error reading %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -245,7 +349,7 @@ environment:
 		Body     string
 		DumpEnv  bool
 		Env      []string
-	}{r, hostname, Version, DebugSummary(data, 512), r.FormValue("env") == "dump", os.Environ()})
+	}{r, hostname, Version, DebugSummary(data, 512), QueryArg(r,"env") == "dump", os.Environ()})
 	if err != nil {
 		Critf("Template execution failed: %v", err)
 	}
@@ -253,19 +357,23 @@ environment:
 }
 */
 
-// DebugHandler returns debug/useful info to http client.
+// DebugHandler returns debug/useful info to HTTP client.
+// Note this can be dangerous and shouldn't be exposed to the internet.
+// A safer version is available as part of fortio's proxy
+// https://github.com/fortio/proxy/blob/main/rp/reverse_proxy.go
 func DebugHandler(w http.ResponseWriter, r *http.Request) {
-	LogRequest(r, "Debug")
+	log.LogRequest(r, "Debug")
 	var buf bytes.Buffer
 	buf.WriteString("Φορτίο version ")
 	buf.WriteString(version.Long())
 	buf.WriteString(" echo debug server up for ")
-	buf.WriteString(fmt.Sprint(RoundDuration(time.Since(startTime))))
+	fmt.Fprint(&buf, RoundDuration(time.Since(startTime)))
 	buf.WriteString(" on ")
 	hostname, _ := os.Hostname()
 	buf.WriteString(hostname)
 	buf.WriteString(" - request from ")
 	buf.WriteString(r.RemoteAddr)
+	buf.WriteString(log.TLSInfo(r))
 	buf.WriteString("\n\n")
 	buf.WriteString(r.Method)
 	buf.WriteByte(' ')
@@ -277,7 +385,7 @@ func DebugHandler(w http.ResponseWriter, r *http.Request) {
 	buf.WriteString("Host: ")
 	buf.WriteString(r.Host)
 
-	var keys []string // nolint: prealloc // header is multi valued map,...
+	keys := make([]string, 0, len(r.Header))
 	for k := range r.Header {
 		keys = append(keys, k)
 	}
@@ -296,7 +404,7 @@ func DebugHandler(w http.ResponseWriter, r *http.Request) {
 			first = false
 		}
 	}
-	data, err := ioutil.ReadAll(r.Body)
+	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		/*
 			expected := r.ContentLength
@@ -316,22 +424,19 @@ func DebugHandler(w http.ResponseWriter, r *http.Request) {
 	buf.WriteString("\n\nbody:\n\n")
 	buf.WriteString(DebugSummary(data, 512))
 	buf.WriteByte('\n')
-	if r.FormValue("env") == "dump" {
+	if QueryArg(r, "env") == "dump" {
 		buf.WriteString("\nenvironment:\n\n")
 		for _, v := range os.Environ() {
 			buf.WriteString(v)
 			buf.WriteByte('\n')
 		}
 	}
-	w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
+	handleCommonArgs(w, r)
+	jrpc.SetHeaderIfMissing(w.Header(), "Content-Type", "text/plain; charset=UTF-8")
 	if _, err = w.Write(buf.Bytes()); err != nil {
 		log.Errf("Error writing response %v to %v", err, r.RemoteAddr)
 	}
-	/*
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-	*/
+	// Flush(w)
 }
 
 // CacheOn sets the header for indefinite caching.
@@ -339,26 +444,43 @@ func CacheOn(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "max-age=365000000, immutable")
 }
 
-// Serve starts a debug / echo http server on the given port.
+// EchoDebugPath returns the additional echo handler path behind debugPath (ie /debug -> /debug/echo/).
+func EchoDebugPath(debugPath string) string {
+	return strings.TrimSuffix(debugPath, "/") + "/echo/"
+}
+
+// Serve starts a debug / echo HTTP server on the given port.
 // Returns the mux and addr where the listening socket is bound.
 // The .Port can be retrieved from it when requesting the 0 port as
-// input for dynamic http server.
+// input for dynamic HTTP server.
 func Serve(port, debugPath string) (*http.ServeMux, net.Addr) {
+	return ServeTLS(port, debugPath, &TLSOptions{})
+}
+
+// ServeTLS starts a debug / echo server on the given port,
+// using TLS if certPath and keyPath aren't empty.
+func ServeTLS(port, debugPath string, to *TLSOptions) (*http.ServeMux, net.Addr) {
 	startTime = time.Now()
-	mux, addr := HTTPServer("echo", port)
+	var mux *http.ServeMux
+	var addr net.Addr
+	if to.DoTLS() {
+		mux, addr = HTTPSServer("https-echo", port, to)
+	} else {
+		mux, addr = HTTPServer("http-echo", port)
+	}
 	if addr == nil {
 		return nil, nil // error already logged
 	}
 	if debugPath != "" {
-		mux.HandleFunc(debugPath, DebugHandler)
-		mux.HandleFunc(strings.TrimSuffix(debugPath, "/")+"/echo/", EchoHandler) // Fix #524
+		mux.Handle(debugPath, Gzip(http.HandlerFunc(DebugHandler)))
+		mux.HandleFunc(EchoDebugPath(debugPath), EchoHandler) // Fix #524
 	}
 	mux.HandleFunc("/", EchoHandler)
 	return mux, addr
 }
 
 // ServeTCP is Serve() but restricted to TCP (return address is assumed
-// to be TCP - will panic for unix domain).
+// to be TCP - will panic for Unix domain).
 func ServeTCP(port, debugPath string) (*http.ServeMux, *net.TCPAddr) {
 	mux, addr := Serve(port, debugPath)
 	if addr == nil {
@@ -369,24 +491,35 @@ func ServeTCP(port, debugPath string) (*http.ServeMux, *net.TCPAddr) {
 
 // -- formerly in ui handler
 
-// SetupPPROF add pprof to the mux (mirror the init() of http pprof).
+// SetupPPROF add pprof to the mux (mirror the init() of HTTP pprof).
 func SetupPPROF(mux *http.ServeMux) {
-	mux.HandleFunc("/debug/pprof/", LogAndCall("pprof:index", pprof.Index))
-	mux.HandleFunc("/debug/pprof/cmdline", LogAndCall("pprof:cmdline", pprof.Cmdline))
-	mux.HandleFunc("/debug/pprof/profile", LogAndCall("pprof:profile", pprof.Profile))
-	mux.HandleFunc("/debug/pprof/symbol", LogAndCall("pprof:symbol", pprof.Symbol))
-	mux.HandleFunc("/debug/pprof/trace", LogAndCall("pprof:trace", pprof.Trace))
+	log.Warnf("pprof endpoints enabled on /debug/pprof/*")
+	mux.HandleFunc("/debug/pprof/", log.LogAndCall("pprof:index", pprof.Index))
+	mux.HandleFunc("/debug/pprof/cmdline", log.LogAndCall("pprof:cmdline", pprof.Cmdline))
+	mux.HandleFunc("/debug/pprof/profile", log.LogAndCall("pprof:profile", pprof.Profile))
+	mux.HandleFunc("/debug/pprof/symbol", log.LogAndCall("pprof:symbol", pprof.Symbol))
+	mux.HandleFunc("/debug/pprof/trace", log.LogAndCall("pprof:trace", pprof.Trace))
 }
 
-// -- Fetch er (simple http proxy) --
+// -- Fetch er (simple HTTP proxy) --
 
-var proxyClient = CreateProxyClient()
+var (
+	sharedProxyClient *http.Client
+	once              sync.Once
+)
+
+func getProxyClient() *http.Client {
+	once.Do(func() {
+		sharedProxyClient = CreateProxyClient()
+	})
+	return sharedProxyClient
+}
 
 // FetcherHandler2 is the handler for the fetcher/proxy that supports h2 input and makes a
 // new request with all headers copied (allows to test sticky routing)
 // Note this should only be made available to trusted clients.
 func FetcherHandler2(w http.ResponseWriter, r *http.Request) {
-	LogRequest(r, "Fetch proxy2")
+	log.LogRequest(r, "Fetch proxy2")
 	query := r.URL.Query()
 	vals, ok := query["url"]
 	if !ok {
@@ -398,19 +531,22 @@ func FetcherHandler2(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing url value", http.StatusBadRequest)
 		return
 	}
-	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
-		url = "http://" + url
+	if !strings.HasPrefix(url, fnet.PrefixHTTP) && !strings.HasPrefix(url, fnet.PrefixHTTPS) {
+		url = fnet.PrefixHTTP + url
 	}
-	req := MakeSimpleRequest(url, r, fetch2CopiesAllHeader.Get())
+	req, opts := MakeSimpleRequest(url, r, Fetch2CopiesAllHeader.Get())
 	if req == nil {
 		http.Error(w, "parsing url failed, invalid url", http.StatusBadRequest)
 		return
 	}
 	OnBehalfOfRequest(req, r)
+	proxyClient := getProxyClient()
+	setClientOptions(proxyClient, opts)
+	//nolint:gosec // the url is indeed config provided.
 	resp, err := proxyClient.Do(req)
 	if err != nil {
 		msg := fmt.Sprintf("Error for %q: %v", url, err)
-		log.Errf(msg)
+		log.Errf("%s", msg)
 		http.Error(w, msg, http.StatusBadRequest)
 		return
 	}
@@ -431,7 +567,7 @@ func FetcherHandler2(w http.ResponseWriter, r *http.Request) {
 
 // FetcherHandler is the handler for the fetcher/proxy.
 func FetcherHandler(w http.ResponseWriter, r *http.Request) {
-	LogRequest(r, "Fetch (prefix stripped)")
+	log.LogRequest(r, "Fetch (prefix stripped)")
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		log.Errf("hijacking not supported: %v", r.Proto)
@@ -447,14 +583,18 @@ func FetcherHandler(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 	// Stripped prefix gets replaced by ./ - sometimes...
 	url := strings.TrimPrefix(r.URL.String(), "./")
-	opts := NewHTTPOptions("http://" + url)
-	opts.HTTPReqTimeOut = 5 * time.Minute
+	opts := CommonHTTPOptionsFromForm(r)
+	if opts.HTTPReqTimeOut == 0 {
+		opts.HTTPReqTimeOut = 1 * time.Minute
+	}
+	opts.Init(url)
 	OnBehalfOf(opts, r)
+	//nolint:contextcheck // TODO: yes we should plug an aborter in the HTTP options that's based on this request's context.
 	client, _ := NewClient(opts)
 	if client == nil {
 		return // error logged already
 	}
-	_, data, _ := client.Fetch()
+	_, data, _ := client.Fetch(r.Context())
 	_, err = conn.Write(data)
 	if err != nil {
 		log.Errf("Error writing fetched data to %v: %v", r.RemoteAddr, err)
@@ -466,49 +606,26 @@ func FetcherHandler(w http.ResponseWriter, r *http.Request) {
 
 // RedirectToHTTPSHandler handler sends a redirect to same URL with https.
 func RedirectToHTTPSHandler(w http.ResponseWriter, r *http.Request) {
-	dest := "https://" + r.Host + r.URL.String()
-	LogRequest(r, "Redirecting to "+dest)
-	http.Redirect(w, r, dest, http.StatusSeeOther)
+	dest := fnet.PrefixHTTPS + r.Host + r.URL.String()
+	log.LogRequest(r, "Redirecting to "+dest)
+	http.Redirect(w, r, dest, http.StatusSeeOther) //nolint:gosec // G710: https redirect to same host, by design.
 }
 
 // RedirectToHTTPS Sets up a redirector to https on the given port.
 // (Do not create a loop, make sure this is addressed from an ingress).
 func RedirectToHTTPS(port string) net.Addr {
-	m, a := HTTPServer("https redirector", port)
-	if m == nil {
-		return nil // error already logged
-	}
-	m.HandleFunc("/", RedirectToHTTPSHandler)
-	return a
+	return HTTPServerWithHandler("https redirector", port, http.HandlerFunc(RedirectToHTTPSHandler))
 }
 
-// LogRequest logs the incoming request, including headers when loglevel is verbose.
-func LogRequest(r *http.Request, msg string) {
-	log.Infof("%s: %v %v %v %v (%s) %s %q", msg, r.Method, r.URL, r.Proto, r.RemoteAddr,
-		r.Header.Get("X-Forwarded-Proto"), r.Header.Get("X-Forwarded-For"), r.Header.Get("User-Agent"))
-	if log.LogVerbose() {
-		// Host is removed from headers map and put separately
-		log.LogVf("Header Host: %v", r.Host)
-		for name, headers := range r.Header {
-			for _, h := range headers {
-				log.LogVf("Header %v: %v\n", name, h)
-			}
-		}
-	}
-}
-
-// LogAndCall wraps an HTTP handler to log the request first.
+// Deprecated: use fortio.org/log.LogAndCall().
 func LogAndCall(msg string, hf http.HandlerFunc) http.HandlerFunc {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		LogRequest(r, msg)
-		hf(w, r)
-	})
+	return log.LogAndCall(msg, hf)
 }
 
 // LogAndCallNoArg is LogAndCall for functions not needing the response/request args.
+// Short cut for:
+//
+//	log.LogAndCall(msg, func(_ http.ResponseWriter, _ *http.Request) { f() })
 func LogAndCallNoArg(msg string, f func()) http.HandlerFunc {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		LogRequest(r, msg)
-		f()
-	})
+	return log.LogAndCall(msg, func(_ http.ResponseWriter, _ *http.Request) { f() })
 }

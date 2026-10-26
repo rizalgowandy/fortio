@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright 2018 Fortio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,75 +19,54 @@ package bincommon
 // Do not add any external dependencies we want to keep fortio minimal.
 
 import (
+	"context"
 	"flag"
-	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"reflect"
 	"strings"
 
+	"fortio.org/dflag"
 	"fortio.org/fortio/fhttp"
 	"fortio.org/fortio/fnet"
-	"fortio.org/fortio/log"
-	"fortio.org/fortio/version"
+	"fortio.org/fortio/periodic"
+	"fortio.org/log"
+	"fortio.org/safecast"
 )
 
-// -- Support for multiple instances of -H flag on cmd line.
-type headersFlagList struct{}
-
-func (f *headersFlagList) String() string {
-	return ""
-}
-
-func (f *headersFlagList) Set(value string) error {
-	return httpOpts.AddAndValidateExtraHeader(value)
-}
-
-// -- end of functions for -H support
-
-// FlagsUsage prints end of the usage() (flags part + error message).
-func FlagsUsage(w io.Writer, msgs ...interface{}) {
-	_, _ = fmt.Fprintf(w, "flags are:\n")
-	flag.CommandLine.SetOutput(w)
-	flag.PrintDefaults()
-	if len(msgs) > 0 {
-		_, _ = fmt.Fprintln(w, msgs...)
-	}
-}
+// FortioHook is used in fortio/cli and fortio/rapi to customize the run and introduce for instance clienttrace
+// and fortiotel access logger.
+type FortioHook func(*fhttp.HTTPOptions, *periodic.RunnerOptions)
 
 var (
-	compressionFlag = flag.Bool("compression", false, "Enable http compression")
-	keepAliveFlag   = flag.Bool("keepalive", true, "Keep connection alive (only for fast http 1.1)")
+	compressionFlag = flag.Bool("compression", false, "Enable HTTP compression")
+	keepAliveFlag   = flag.Bool("keepalive", true, "Keep connection alive (only for fast HTTP/1.1)")
 	halfCloseFlag   = flag.Bool("halfclose", false,
 		"When not keepalive, whether to half close the connection (only for fast http)")
-	httpReqTimeoutFlag  = flag.Duration("timeout", fhttp.HTTPReqTimeOutDefaultValue, "Connection and read timeout value (for http)")
-	stdClientFlag       = flag.Bool("stdclient", false, "Use the slower net/http standard client (works for TLS)")
-	http10Flag          = flag.Bool("http1.0", false, "Use http1.0 (instead of http 1.1)")
-	httpsInsecureFlag   = flag.Bool("k", false, "Do not verify certs in https connections")
+	httpReqTimeoutFlag  = flag.Duration("timeout", fhttp.HTTPReqTimeOutDefaultValue, "Connection and read timeout value (for HTTP)")
+	stdClientFlag       = flag.Bool("stdclient", false, "Use the slower net/http standard client (slower but supports h2/h2c)")
+	http10Flag          = flag.Bool("http1.0", false, "Use HTTP/1.0 (instead of HTTP/1.1)")
+	h2Flag              = flag.Bool("h2", false, "Attempt to use HTTP/2.0 / h2 (instead of HTTP/1.1) for both TLS and h2c")
+	httpsInsecureFlag   = flag.Bool("k", false, "Do not verify certs in HTTPS/TLS/gRPC connections")
 	httpsInsecureFlagL  = flag.Bool("https-insecure", false, "Long form of the -k flag")
 	resolve             = flag.String("resolve", "", "Resolve host name to this `IP`")
-	headersFlags        headersFlagList
 	httpOpts            fhttp.HTTPOptions
 	followRedirectsFlag = flag.Bool("L", false, "Follow redirects (implies -std-client) - do not use for load test")
-	userCredentialsFlag = flag.String("user", "", "User credentials for basic authentication (for http). Input data format"+
+	userCredentialsFlag = flag.String("user", "", "User credentials for basic authentication (for HTTP). Input data format"+
 		" should be `user:password`")
-	// QuietFlag is the value of -quiet.
-	QuietFlag       = flag.Bool("quiet", false, "Quiet mode: sets the loglevel to Error and reduces the output.")
 	contentTypeFlag = flag.String("content-type", "",
-		"Sets http content type. Setting this value switches the request method from GET to POST.")
+		"Sets HTTP content type. Setting this value switches the request method from GET to POST.")
 	// PayloadSizeFlag is the value of -payload-size.
 	PayloadSizeFlag = flag.Int("payload-size", 0, "Additional random payload size, replaces -payload when set > 0,"+
-		" must be smaller than -maxpayloadsizekb. Setting this switches http to POST.")
+		" must be smaller than -maxpayloadsizekb. Setting this switches HTTP to POST.")
 	// PayloadFlag is the value of -payload.
 	PayloadFlag = flag.String("payload", "", "Payload string to send along")
 	// PayloadFileFlag is the value of -paylaod-file.
-	PayloadFileFlag = flag.String("payload-file", "", "File `path` to be use as payload (POST for http), replaces -payload when set.")
+	PayloadFileFlag = flag.String("payload-file", "", "File `path` to be use as payload (POST for HTTP), replaces -payload when set.")
+	// PayloadStreamFlag for streaming payload from stdin (curl only).
+	PayloadStreamFlag = flag.Bool("stream", false, "Stream payload from stdin (only for fortio curl mode)")
 	// UnixDomainSocket to use instead of regular host:port.
 	unixDomainSocketFlag = flag.String("unix-socket", "", "Unix domain socket `path` to use for physical connection")
-	// ConfigDirectoryFlag is where to watch for dynamic flag updates.
-	ConfigDirectoryFlag = flag.String("config", "",
-		"Config directory `path` to watch for changes of dynamic flags (empty for no watch)")
 	// CertFlag is the flag for the path for the client custom certificate.
 	CertFlag = flag.String("cert", "", "`Path` to the certificate file to be used for client or server TLS")
 	// KeyFlag is the flag for the path for the key for the `cert`.
@@ -96,65 +75,89 @@ var (
 	CACertFlag = flag.String("cacert", "",
 		"`Path` to a custom CA certificate file to be used for the TLS client connections, "+
 			"if empty, use https:// prefix for standard internet/system CAs")
-	// LogErrorsFlag determines if the non ok http error codes get logged as they occur or not.
-	LogErrorsFlag = flag.Bool("log-errors", true, "Log http non 2xx/418 error codes as they occur")
-	// RunIDFlag is optional RunID to be present in json results (and default json result filename if not 0).
-	RunIDFlag = flag.Int64("runid", 0, "Optional RunID to add to json result and auto save filename, to match server mode")
+	mTLS = flag.Bool("mtls", false, "Require client certificate signed by -cacert for client connections")
+	// LogErrorsFlag determines if the non-OK HTTP error codes get logged as they occur or not.
+	LogErrorsFlag = flag.Bool("log-errors", true, "Log HTTP non-2xx/418 status codes as they occur")
+	// RunIDFlag is optional RunID to be present in JSON results (and default JSON result filename if not 0).
+	RunIDFlag = flag.Int64("runid", 0, "Optional RunID to add to JSON result and auto save filename, to match server mode")
 	// HelpFlag is true if help/usage is being requested by the user.
-	HelpFlag   = flag.Bool("h", false, "Print usage/help on stdout")
 	warmupFlag = flag.Bool("sequential-warmup", false,
-		"http(s) runner warmup done in parallel instead of sequentially. When set, restores pre 1.21 behavior")
+		"http(s) runner warmup done sequentially instead of parallel. When set, restores pre 1.21 behavior")
 	curlHeadersStdout = flag.Bool("curl-stdout-headers", false,
-		"Restore pre 1.22 behavior where http headers of the fast client are output to stdout in curl mode. now stderr by default.")
+		"Restore pre 1.22 behavior where HTTP headers of the fast client are output to stdout in curl mode. now stderr by default.")
+	// ConnectionReuseRange Dynamic string flag to set the max connection reuse range.
+	ConnectionReuseRange = dflag.Flag("connection-reuse", dflag.New("",
+		"Range `min:max` for the max number of connections to reuse for each thread, default to unlimited. "+
+			"e.g. 10:30 means randomly choose a max connection reuse threshold between 10 and 30 requests.").
+		WithValidator(ConnectionReuseRangeValidator(&httpOpts)))
+	// NoReResolveFlag is false if we want to resolve the DNS name for each new connection.
+	NoReResolveFlag = flag.Bool("no-reresolve", false, "Keep the initial DNS resolution and "+
+		"don't re-resolve when making new connections (because of error or reuse limit reached)")
+	MethodFlag = flag.String("X", "", "HTTP method to use instead of GET/POST depending on payload/content-type")
 )
 
 // SharedMain is the common part of main from fortio_main and fcurl.
-func SharedMain(usage func(io.Writer, ...interface{})) {
-	flag.Var(&headersFlags, "H", "Additional `header`(s)")
+// It sets up the common flags, the rest of usage/argument/flag handling
+// is now moved to the [fortio.org/cli] and [fortio.org/scli] packages.
+func SharedMain() {
+	flag.Func("H",
+		"Additional HTTP header(s) or gRPC metadata. Multiple `key:value` pairs can be passed using multiple -H.",
+		httpOpts.AddAndValidateExtraHeader)
 	flag.IntVar(&fhttp.BufferSizeKb, "httpbufferkb", fhttp.BufferSizeKb,
-		"Size of the buffer (max data size) for the optimized http client in `kbytes`")
+		"Size of the buffer (max data size) for the optimized HTTP client in `kbytes`")
 	flag.BoolVar(&fhttp.CheckConnectionClosedHeader, "httpccch", fhttp.CheckConnectionClosedHeader,
 		"Check for Connection: Close Header")
-	// Special case so `fcurl -version` and `--version` and `version` and ... work
-	if len(os.Args) < 2 {
-		return
-	}
-	firstArg := os.Args[1]
-	if strings.Contains(firstArg, "version") {
-		if len(os.Args) >= 3 && strings.Contains(os.Args[2], "s") {
-			// so `fortio version -s` is the short version; everything else is long/full
-			fmt.Println(version.Short())
-		} else {
-			fmt.Println(version.Long())
-		}
-		os.Exit(0)
-	}
-	if strings.Contains(firstArg, "help") || firstArg == "-h" {
-		usage(os.Stdout)
-		os.Exit(0)
-	}
+	// FlagResolveIPType indicates which IP types to resolve.
+	// With round-robin resolution now the default, you are likely to get IPv6 which may not work if
+	// use both type (`ip`). In particular some test environments like the CI do have IPv6
+	// for localhost but fail to connect. So we made the default ip4 only.
+	dflag.Flag("resolve-ip-type", fnet.FlagResolveIPType)
+	// FlagResolveMethod decides which method to use when multiple IPs are returned for a given name
+	// default assumes one gets all the IPs in the first call and does round-robin across these.
+	// first just picks the first answer, rr rounds robin on each answer.
+	dflag.Flag("dns-method", fnet.FlagResolveMethod)
+	dflag.Flag("echo-server-default-params", fhttp.DefaultEchoServerParams)
+	dflag.FlagBool("proxy-all-headers", fhttp.Fetch2CopiesAllHeader)
+	dflag.Flag("server-idle-timeout", fhttp.ServerIdleTimeout)
+	// MaxDelay is the maximum delay allowed for the echoserver responses.
+	// It is a dynamic flag with default value of 1.5s so we can test the default 1s timeout in envoy.
+	dflag.Flag("max-echo-delay", fhttp.MaxDelay)
+	// call [scli.ServerMain()] to complete the setup.
 }
 
 // FetchURL is fetching url content and exiting with 1 upon error.
 // common part between fortio_main and fcurl.
 func FetchURL(o *fhttp.HTTPOptions) {
-	// keepAlive could be just false when making 1 fetch but it helps debugging
-	// the http client when making a single request if using the flags
+	// keepAlive could be just false when making 1 fetch, but it helps debugging
+	// the HTTP client when making a single request if using the flags
+	o.DataWriter = os.Stdout
 	client, _ := fhttp.NewClient(o)
 	// big gotcha that nil client isn't nil interface value (!)
 	if client == nil || reflect.ValueOf(client).IsNil() {
-		return // error logged already
+		os.Exit(1) // error logged already
 	}
-	code, data, header := client.Fetch()
-	log.LogVf("Fetch result code %d, data len %d, headerlen %d", code, len(data), header)
-	if *curlHeadersStdout {
-		os.Stdout.Write(data)
+	var code int
+	var dataLen int64
+	var header uint
+	if client.HasBuffer() {
+		// Fast client
+		var data []byte
+		var headerI int
+		code, data, headerI = client.Fetch(context.Background()) //nolint:staticcheck // keep using backward compatible Fetch for now
+		dataLen = safecast.MustConv[int64](len(data))
+		header = safecast.MustConv[uint](headerI)
+		if *curlHeadersStdout {
+			os.Stdout.Write(data)
+		} else {
+			os.Stderr.Write(data[:header])
+			os.Stdout.Write(data[header:])
+		}
 	} else {
-		os.Stderr.Write(data[:header])
-		os.Stdout.Write(data[header:])
+		code, dataLen, header = client.StreamFetch(context.Background())
 	}
+	log.LogVf("Fetch result code %d, data len %d, headerlen %d", code, dataLen, header)
 	if code != http.StatusOK {
-		log.Errf("Error status %d : %s", code, fhttp.DebugSummary(data, 512))
+		log.Errf("Error status %d", code)
 		os.Exit(1)
 	}
 }
@@ -170,12 +173,21 @@ func TLSInsecure() bool {
 	return TLSInsecure
 }
 
+// ConnectionReuseRangeValidator returns a validator function that checks if the connection reuse range is valid
+// and set in httpOpts.
+func ConnectionReuseRangeValidator(httpOpts *fhttp.HTTPOptions) func(string) error {
+	return func(value string) error {
+		return httpOpts.ValidateAndSetConnectionReuseRange(value)
+	}
+}
+
 // SharedHTTPOptions is the flag->httpoptions transfer code shared between
-// fortio_main and fcurl.
+// fortio_main and fcurl. It also sets fhttp.DefaultHTTPOptions.
 func SharedHTTPOptions() *fhttp.HTTPOptions {
 	url := strings.TrimLeft(flag.Arg(0), " \t\r\n")
 	httpOpts.URL = url
 	httpOpts.HTTP10 = *http10Flag
+	httpOpts.H2 = *h2Flag
 	httpOpts.DisableFastClient = *stdClientFlag
 	httpOpts.DisableKeepAlive = !*keepAliveFlag
 	httpOpts.AllowHalfClose = *halfCloseFlag
@@ -184,8 +196,20 @@ func SharedHTTPOptions() *fhttp.HTTPOptions {
 	httpOpts.Insecure = TLSInsecure()
 	httpOpts.Resolve = *resolve
 	httpOpts.UserCredentials = *userCredentialsFlag
-	httpOpts.ContentType = *contentTypeFlag
-	httpOpts.Payload = fnet.GeneratePayload(*PayloadFileFlag, *PayloadSizeFlag, *PayloadFlag)
+	if len(*contentTypeFlag) > 0 {
+		// only set content-type from flag if flag isn't empty as it can come also from -H content-type:...
+		httpOpts.ContentType = *contentTypeFlag
+	}
+	if *PayloadStreamFlag {
+		httpOpts.PayloadReader = os.Stdin
+	} else {
+		// Returns nil if file read error, an empty but non nil slice if no payload is requested.
+		httpOpts.Payload = fnet.GeneratePayload(*PayloadFileFlag, *PayloadSizeFlag, *PayloadFlag)
+		if httpOpts.Payload == nil {
+			// Error already logged
+			os.Exit(1)
+		}
+	}
 	httpOpts.UnixDomainSocket = *unixDomainSocketFlag
 	if *followRedirectsFlag {
 		httpOpts.FollowRedirects = true
@@ -194,7 +218,11 @@ func SharedHTTPOptions() *fhttp.HTTPOptions {
 	httpOpts.CACert = *CACertFlag
 	httpOpts.Cert = *CertFlag
 	httpOpts.Key = *KeyFlag
+	httpOpts.MTLS = *mTLS
 	httpOpts.LogErrors = *LogErrorsFlag
 	httpOpts.SequentialWarmup = *warmupFlag
+	httpOpts.NoResolveEachConn = *NoReResolveFlag
+	httpOpts.MethodOverride = *MethodFlag
+	fhttp.DefaultHTTPOptions = &httpOpts
 	return &httpOpts
 }

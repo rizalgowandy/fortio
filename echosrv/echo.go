@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors.
+// Copyright 2017 Fortio Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,15 +32,17 @@ import (
 var (
 	port      = flag.String("port", "8080", "default http port, either port or address:port can be specified")
 	debugPath = flag.String("debug-path", "/debug", "path for debug url, set to empty for no debug")
+	certFlag  = flag.String("cert", "", "`Path` to the certificate file to be used for client or server TLS")
+	keyFlag   = flag.String("key", "", "`Path` to the key file matching the -cert")
 )
 
 func main() {
 	flag.Parse()
 	if len(os.Args) >= 2 && strings.Contains(os.Args[1], "version") {
-		fmt.Println(version.Long())
+		fmt.Println(version.Full())
 		os.Exit(0)
 	}
-	if _, addr := fhttp.Serve(*port, *debugPath); addr == nil {
+	if _, addr := fhttp.ServeTLS(*port, *debugPath, &fhttp.TLSOptions{Cert: *certFlag, Key: *keyFlag}); addr == nil {
 		os.Exit(1) // error already logged
 	}
 	select {}

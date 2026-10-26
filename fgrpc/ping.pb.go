@@ -5,9 +5,11 @@
 Package fgrpc is a generated protocol buffer package.
 
 It is generated from these files:
+
 	ping.proto
 
 It has these top-level messages:
+
 	PingMessage
 */
 package fgrpc
@@ -20,7 +22,7 @@ import (
 )
 
 import (
-	context "golang.org/x/net/context"
+	context "context"
 	grpc "google.golang.org/grpc"
 )
 
@@ -88,7 +90,7 @@ var (
 )
 
 // This is a compile-time assertion to ensure that this generated file
-// is compatible with the grpc package it is being compiled against.
+// is compatible with the gRPC package it is being compiled against.
 const _ = grpc.SupportPackageIsVersion4
 
 // Client API for PingServer service

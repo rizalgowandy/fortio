@@ -1,14 +1,15 @@
 # Golang CircleCI 2.0 configuration file
 #
 # Check https://circleci.com/docs/2.0/language-go/ for more details
-version: 2
+version: 2.1
 
 # common setup and steps
-defaultEnv: &defaultEnv
-    docker:
-      # specify the version
-      - image: docker.io/fortio/fortio.build:v38
-    working_directory: /go/src/fortio.org/fortio
+defaultEnv:
+  &defaultEnv
+  docker:
+    # specify the version
+    - image: docker.io/fortio/fortio.build:v90@sha256:036f5b5d4df9ce30e0574f212d19ced86ddc7b0255f58a536b008943e5c4efc7
+  working_directory: /build/fortio
 
 jobs:
   unit-tests:
@@ -16,24 +17,29 @@ jobs:
     steps:
       - checkout
       - run: make test
+    # The resource_class feature allows configuring CPU and RAM resources for each job. Different resource classes are available for different executors. https://circleci.com/docs/2.0/configuration-reference/#resourceclass
+    resource_class: large
   release-tests:
     <<: *defaultEnv
     steps:
       - setup_remote_docker:
-          version: 17.11.0-ce
+          version: previous
       - checkout
       - run: make release-test
-  linters:
-    <<: *defaultEnv
-    steps:
-      - checkout
+# linters are now part of gochecks shared github action workflows (go checks)
+#  linters:
+    #<<: *defaultEnv
+    #steps:
+      #- checkout
       # If ran with default we get random errors because OOM killer kills some linters
-      - run: make local-lint DEBUG_LINTERS="--concurrency=2"
-  codecov:
-    <<: *defaultEnv
-    steps:
-      - checkout
-      - run: make coverage
+      #- run: make local-lint DEBUG_LINTERS="--concurrency=2"
+  # codecov:
+  #   <<: *defaultEnv
+  #   steps:
+  #     - checkout
+  #     - run: make coverage
+  #   # The resource_class feature allows configuring CPU and RAM resources for each job. Different resource classes are available for different executors. https://circleci.com/docs/2.0/configuration-reference/#resourceclass
+  #   resource_class: large
 
 workflows:
   version: 2
@@ -41,5 +47,5 @@ workflows:
     jobs:
       - unit-tests
       - release-tests
-      - codecov
-      - linters
+#      - codecov
+#      - linters

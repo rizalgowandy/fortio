@@ -1,5 +1,5 @@
 #! /bin/bash
-# Copyright 2017 Istio Authors.
+# Copyright 2017 Fortio Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,21 +16,21 @@
 # To be run by ../Makefile as release/release.sh
 set -x
 set -e
-# Release tgz Dockerfile is based on the normal docker one
-cat Dockerfile release/Dockerfile.in > release/Dockerfile
-docker build -f release/Dockerfile -t fortio/fortio:release .
+docker build -f release/Dockerfile.in -t fortio/fortio:release .
 DOCKERID=$(docker create --name fortio_release fortio/fortio:release x)
 function cleanup {
   docker rm fortio_release
 }
 trap cleanup EXIT
 set -o pipefail
-# docker cp will create 2 level of dir if first one exists, make sure it doesnt
+# docker cp will create 2 level of dir if first one exists, make sure it doesn't
 rm -f release/tgz/*
 rmdir release/tgz || true
 docker cp -a fortio_release:/tgz/ release/tgz
 # Check the tar balls and zip
-tar tvfz release/tgz/*.tgz
+for f in release/tgz/*.tgz; do
+  tar tvfz "$f"
+done
 unzip -l release/tgz/*.zip
 # then save the results 1 level up
 mv release/tgz/* release/

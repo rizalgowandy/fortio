@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright 2017 Fortio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,14 +13,13 @@
 // limitations under the License.
 
 //go:build !race
-// +build !race
 
 package periodic
 
 import (
 	"testing"
 
-	"fortio.org/fortio/log"
+	"fortio.org/log"
 )
 
 // Rerun some test with various log level for coverage of the print statements

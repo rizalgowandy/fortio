@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright 2017 Fortio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,14 +13,13 @@
 // limitations under the License.
 
 //go:build !race
-// +build !race
 
 package fhttp
 
 import (
 	"testing"
 
-	"fortio.org/fortio/log"
+	"fortio.org/log"
 )
 
 // Rerun some test with various log level for coverage of the debug statements
@@ -31,4 +30,9 @@ func TestDebugMode(t *testing.T) {
 	TestHTTPRunner(t)
 	TestNoFirstChunkSizeInitially(t)
 	TestFetchAndOnBehalfOf(t)
+}
+
+func TesWarningMode(t *testing.T) {
+	log.SetLogLevel(log.Warning)
+	TestHTTPRunner(t)
 }

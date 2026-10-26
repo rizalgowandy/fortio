@@ -1,0 +1,142 @@
+# testscript framework tests for fortio's main binary / command line
+# Eventually we can convert most of Webtest.sh to here (except parts specifically about testing the Docker image)
+
+# Basic usage test
+!fortio
+!stdout .
+stderr 'Missing command argument'
+
+# (short) version
+fortio version
+stdout '^dev$'
+!stderr .
+
+# (long) version
+fortio buildinfo
+stdout '^dev  go'
+stdout 'path	fortio.org/fortio'
+!stderr .
+
+# Content-Type override through headers
+fortio curl -H 'content-TYPE: foo/bar' -H 'xyz: bar blah' https://debug.fortio.org/test-path
+stderr 'HTTP/1.1 200 OK'
+stdout 'Xyz: bar blah'
+stdout 'Content-Type: foo/bar'
+stdout 'POST /test-path HTTP/1.1'
+
+# Script command tests
+fortio script test.gr
+stdout '^42$'
+
+# Error case: bad file
+!fortio script no-such-file.gr
+stderr 'open no-such-file.gr: (no such file or directory|The system cannot find the file specified)'
+
+# Error case: bad script
+!fortio script bad.gr
+stderr 'err: division by zero'
+
+# Stdin script test
+stdin test.gr
+fortio script -
+stdout '^42$'
+
+# Pseudo interactive test
+fortio script
+stderr 'Starting interactive grol script mode'
+stderr 'EOF'
+
+# fortio.load tests: bad type
+!fortio script badload1.gr
+stderr 'err: Run type \\"badtype\\" unexpected'
+
+# fortio.load tests: config not a map
+!fortio script badload2.gr
+stderr 'wrong type of argument got=STRING, want fortio.load\(string, map\)'
+
+# fortio.load tests: missing destination/url
+!fortio script badload3.gr
+stderr 'err: can.t resolve empty host'
+
+# Curl test
+fortio script curl1.gr
+stdout 'GET /groltxtar HTTP/1.1'
+
+# h2 from options
+fortio script curl2.gr
+stdout 'POST /groltxtar HTTP/2.0'
+stdout 'abcdef' # debug.fortio.org echoes back the payload
+
+# Curl bad url error case
+!fortio script badcurl.gr
+stderr 'err: parse \\"http:// bad\\": invalid character \\" \\" in host name'
+
+# This may cause portability issues or even if you have fortio already running or something else on other ports
+! exec fortio server &
+exec sleep 3 # in ci server needs a bit to start
+fortio script -init 'url="http://localhost:8080/echo"' test_all_modes.gr
+stderr 'Saving .*_test_save.json'
+stdout '🎉 for http - saved as .*_test_save'
+stdout '🎉 for tcp'
+stdout '🎉 for udp'
+stdout '🎉 for grpc'
+[!windows] exec pkill -x fortio
+[windows] exec taskkill /F /IM fortio.exe
+wait
+
+-- badload1.gr --
+fortio.load("badtype", {})
+
+-- badload2.gr --
+fortio.load("http", "not a map")
+
+-- badload3.gr --
+hload({})
+
+-- curl1.gr --
+res := curl("https://debug.fortio.org/groltxtar")
+if res.code != 200 {
+    error("expected 200, got", res.code)
+}
+println(res.body)
+
+-- curl2.gr --
+println(curl("https://debug.fortio.org/groltxtar",{"payload":base64("abcdef"), "h2":true}).body)
+
+-- badcurl.gr --
+curl("http:// bad")
+
+-- test.gr --
+40+2
+
+-- bad.gr --
+1/0
+
+-- test_all_modes.gr --
+// We expect the initial url variable to be set by caller of the script
+if catch(url).err || url == "" {
+    error("initial url not set, -init issue")
+}
+url = "http://localhost:8080/echo"
+r = fortio.load("http", {"url": url, "exactly": 10, "qps": -1, "labels": "test save", "save": true})
+if r.RetCodes["200"] != 10 {
+    error("Error: expected exactly 10 200s for http, got", r.RetCodes)
+}
+println("🎉 for http - saved as", r.ID)
+url = "localhost:8078"
+r = fortio.load("tcp", {"url": url, "exactly": 10, "qps": -1})
+if r.RetCodes["OK"] != 10 {
+    error("Error: expected exactly 10 OK for tcp, got", r.RetCodes)
+}
+println("🎉 for tcp")
+r = fortio.load("udp", {"url": url, "exactly": 10, "qps": -1})
+if r.RetCodes["OK"] != 10 {
+    error("Error: expected exactly 10 OK for udp, got", r.RetCodes)
+}
+println("🎉 for udp")
+url = "localhost:8079"
+r = fortio.load("grpc", {"url": url, "exactly": 10, "qps": -1})
+if r.RetCodes["SERVING"] != 10 {
+    error("Error: expected exactly 10 SERVING for grpc, got", r.RetCodes)
+}
+println("🎉 for grpc")

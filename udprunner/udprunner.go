@@ -16,6 +16,8 @@ package udprunner
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -24,9 +26,9 @@ import (
 	"time"
 
 	"fortio.org/fortio/fnet"
-	"fortio.org/fortio/log"
 	"fortio.org/fortio/periodic"
 	"fortio.org/fortio/tcprunner"
+	"fortio.org/log"
 )
 
 // TODO: this quite the search and replace udp->udp from tcprunner/ - refactor?
@@ -48,16 +50,18 @@ type RunnerResults struct {
 	aborter       *periodic.Aborter
 }
 
-// Run tests udp request fetching. Main call being run at the target QPS.
+// Run tests UDP request fetching. Main call being run at the target QPS.
 // To be set as the Function in RunnerOptions.
-func (udpstate *RunnerResults) Run(t int) {
+func (udpstate *RunnerResults) Run(_ context.Context, t periodic.ThreadID) (bool, string) {
 	log.Debugf("Calling in %d", t)
 	_, err := udpstate.client.Fetch()
 	if err != nil {
-		udpstate.RetCodes[err.Error()]++
-	} else {
-		udpstate.RetCodes[UDPStatusOK]++
+		errStr := err.Error()
+		udpstate.RetCodes[errStr]++
+		return false, errStr
 	}
+	udpstate.RetCodes[UDPStatusOK]++
+	return true, UDPStatusOK
 }
 
 // UDPOptions are options to the UDPClient.
@@ -67,14 +71,14 @@ type UDPOptions struct {
 	ReqTimeout  time.Duration
 }
 
-// RunnerOptions includes the base RunnerOptions plus udp specific
+// RunnerOptions includes the base RunnerOptions plus UDP specific
 // options.
 type RunnerOptions struct {
 	periodic.RunnerOptions
 	UDPOptions // Need to call Init() to initialize
 }
 
-// UDPClient is the client used for udp echo testing.
+// UDPClient is the client used for UDP echo testing.
 type UDPClient struct {
 	buffer        []byte
 	req           []byte
@@ -91,14 +95,14 @@ type UDPClient struct {
 }
 
 var (
-	// UDPURLPrefix is the URL prefix for triggering udp load.
+	// UDPURLPrefix is the URL prefix for triggering UDP load.
 	UDPURLPrefix = "udp://"
 	// UDPStatusOK is the map key on success.
 	UDPStatusOK  = "OK"
-	errTimeout   = fmt.Errorf("timeout")
-	errShortRead = fmt.Errorf("short read")
-	errLongRead  = fmt.Errorf("bug: long read")
-	errMismatch  = fmt.Errorf("read not echoing writes")
+	errTimeout   = errors.New("timeout")
+	errShortRead = errors.New("short read")
+	errLongRead  = errors.New("bug: long read")
+	errMismatch  = errors.New("read not echoing writes")
 )
 
 // NewUDPClient creates and initialize and returns a client based on the UDPOptions.
@@ -106,7 +110,7 @@ func NewUDPClient(o *UDPOptions) (*UDPClient, error) {
 	c := UDPClient{}
 	d := o.Destination
 	c.destination = d
-	tAddr, err := fnet.UDPResolveDestination(d)
+	tAddr, err := fnet.UDPResolveDestination(context.Background(), d)
 	if tAddr == nil {
 		return nil, err
 	}
@@ -131,7 +135,7 @@ func NewUDPClient(o *UDPOptions) (*UDPClient, error) {
 
 func (c *UDPClient) connect() (net.Conn, error) {
 	c.socketCount++
-	socket, err := net.Dial(c.dest.Network(), c.dest.String())
+	socket, err := net.Dial(c.dest.Network(), c.dest.String()) //nolint:noctx // TODO have contexts and not just abort channel.
 	if err != nil {
 		log.Errf("Unable to connect to %v : %v", c.dest, err)
 		return nil, err
@@ -162,7 +166,7 @@ func (c *UDPClient) Fetch() ([]byte, error) {
 		c.req = tcprunner.GeneratePayload(c.connID, c.messageCount)
 	}
 	n, err := conn.Write(c.req)
-	c.bytesSent = c.bytesSent + int64(n)
+	c.bytesSent += int64(n)
 	if log.LogDebug() {
 		log.Debugf("wrote %d (%q): %v", n, string(c.req), err)
 	}
@@ -182,7 +186,7 @@ func (c *UDPClient) Fetch() ([]byte, error) {
 	}
 	// assert that len(c.buffer) == len(c.req)
 	n, err = conn.Read(c.buffer)
-	c.bytesReceived = c.bytesReceived + int64(n)
+	c.bytesReceived += int64(n)
 	if log.LogDebug() {
 		log.Debugf("read %d (%q): %v", n, string(c.buffer[:n]), err)
 	}
@@ -216,7 +220,7 @@ func (c *UDPClient) Close() int {
 	return c.socketCount
 }
 
-// RunUDPTest runs an udp test and returns the aggregated stats.
+// RunUDPTest runs a UDP test and returns the aggregated stats.
 // Some refactoring to avoid copy-pasta between the now 3 runners would be good.
 func RunUDPTest(o *RunnerOptions) (*RunnerResults, error) {
 	o.RunType = "UDP"
@@ -233,7 +237,7 @@ func RunUDPTest(o *RunnerOptions) (*RunnerResults, error) {
 	total.Destination = o.Destination
 	udpstate := make([]RunnerResults, numThreads)
 	var err error
-	for i := 0; i < numThreads; i++ {
+	for i := range numThreads {
 		r.Options().Runners[i] = &udpstate[i]
 		// Create a client (and transport) and connect once for each 'thread'
 		udpstate[i].client, err = NewUDPClient(&o.UDPOptions)
@@ -247,15 +251,15 @@ func RunUDPTest(o *RunnerOptions) (*RunnerResults, error) {
 				log.LogVf("first hit of %s: err %v, received %d: %q", o.Destination, err, len(data), data)
 			}
 		}
-		// Setup the stats for each 'thread'
+		// Set up the stats for each 'thread'
 		udpstate[i].aborter = total.aborter
 		udpstate[i].RetCodes = make(UDPResultMap)
 	}
 	total.RunnerResults = r.Run()
-	// Numthreads may have reduced but it should be ok to accumulate 0s from
-	// unused ones. We also must cleanup all the created clients.
+	// Numthreads may have reduced, but it should be ok to accumulate 0s from
+	// unused ones. We also must clean up all the created clients.
 	keys := []string{}
-	for i := 0; i < numThreads; i++ {
+	for i := range numThreads {
 		total.SocketCount += udpstate[i].client.Close()
 		total.BytesReceived += udpstate[i].client.bytesReceived
 		total.BytesSent += udpstate[i].client.bytesSent

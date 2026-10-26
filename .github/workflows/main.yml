@@ -1,10 +1,16 @@
-
 name: Release
+
+permissions:
+  actions: read
+  contents: write
+  packages: write
 
 on:
   push:
     tags:
-    - '*'
+      # so a vX.Y.Z-test1 doesn't trigger build
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-pre*'
 
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
@@ -12,94 +18,52 @@ jobs:
   build:
     # The type of runner that the job will run on
     runs-on: ubuntu-latest
-
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v2
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@f054a8b539a109f9f41c372932f1ae047eff08c9
+      - name: Common Setup
+        id: common_setup
+        uses: fortio/workflows/.github/actions/common_setup@main
         with:
-          username: ${{ secrets.DOCKER_USER }}
-          password: ${{ secrets.DOCKER_TOKEN }}
-
+          DOCKER_USER: ${{ secrets.DOCKER_USER }}
+          DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
+      - name: Available platforms
+        run: |
+          echo "Build platforms: ${{ steps.common_setup.outputs.platforms }}"
       - name: Build
         id: build
         run: |
           make info
           make release
           VERSION=$(make echo-version)
-          echo ::set-output name=VERSION::${VERSION}
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
           PACKAGE_VERSION=$(make echo-package-version)
-          echo ::set-output name=PACKAGE_VERSION::${PACKAGE_VERSION}
           echo "Version $VERSION, Package version $PACKAGE_VERSION"
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@ad44023a93711e3deb337508980b4b5e9bcdc5dc
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # pin@v5
         with:
           context: .
+          platforms: linux/amd64,linux/arm64,linux/ppc64le,linux/s390x
           push: true
-          tags: fortio/fortio:${{ steps.build.outputs.VERSION }}, fortio/fortio:latest
+          tags: fortio/fortio:${{ env.VERSION }}, fortio/fortio:latest
 
       - name: Create Release
         id: create_release
-        uses: actions/create-release@v1
+        # Need to find a replacement not using set-output
+        uses: actions/create-release@0cb9c9b65d5d1901c1f53e5e66eaf4afd303e70e # pin@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # This token is provided by Actions, you do not need to create your own token
         with:
           tag_name: ${{ github.ref }}
-          release_name: Fortio ${{ steps.build.outputs.VERSION }}
+          release_name: Fortio ${{ env.VERSION }}
           draft: true
 
-      - name: Upload release artifact 1
-        id: upload-release-asset1
-        uses: actions/upload-release-asset@v1
+      - name: Upload release artifacts
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }} # This pulls from the CREATE RELEASE step above, referencing it's ID to get its outputs object, which include a `upload_url`. See this blog post for more info: https://jasonet.co/posts/new-features-of-github-actions/#passing-data-to-future-steps
-          asset_path: release/fortio_${{ steps.build.outputs.VERSION }}.orig.tar.gz
-          asset_name: fortio_${{ steps.build.outputs.VERSION }}.orig.tar.gz
-          asset_content_type: application/x-compressed-tar
-# Todo find a way to upload all in 1... it's silly to have to do 1 by 1
-      - name: Upload release artifact 2
-        id: upload-release-asset2
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: release/fortio-${{ steps.build.outputs.PACKAGE_VERSION }}-1.x86_64.rpm
-          asset_name: fortio-${{ steps.build.outputs.PACKAGE_VERSION }}-1.x86_64.rpm
-          asset_content_type: application/x-rpm
-      - name: Upload release artifact 3
-        id: upload-release-asset3
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: release/fortio-linux_x64-${{ steps.build.outputs.VERSION }}.tgz
-          asset_name: fortio-linux_x64-${{ steps.build.outputs.VERSION }}.tgz
-          asset_content_type: application/x-compressed-tar
-      - name: Upload release artifact 4
-        id: upload-release-asset4
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: release/fortio_${{ steps.build.outputs.VERSION }}_amd64.deb
-          asset_name: fortio_${{ steps.build.outputs.VERSION }}_amd64.deb
-          asset_content_type: application/vnd.debian.binary-package
-      - name: Upload release artifact 5
-        id: upload-release-asset5
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: release/fortio_win_${{ steps.build.outputs.VERSION }}.zip
-          asset_name: fortio_win_${{ steps.build.outputs.VERSION }}.zip
-          asset_content_type: application/zip
+        run: |
+          tag_name="${GITHUB_REF##*/}"
+          echo "will use tag_name=$tag_name"
+          # tends to fail and not find the release somehow; add a small sleep... (yuck)
+          sleep 10
+          gh release upload "${tag_name}" release/*.{tgz,zip,rpm,deb,gz}
